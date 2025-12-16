@@ -1,0 +1,35 @@
+{
+  "functions": {
+    "source": "functions"
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  },
+  "hosting": {
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ],
+    "rewrites": [
+      {
+        "source": "!/migrate-users.html",
+        "destination": "/index.html"
+      }
+    ],
+    "cleanUrls": true
+  },
+  "emulators": {
+    "auth": {
+      "port": 9099,
+      "import": "./emulator-data/auth"
+    },
+    "firestore": {
+      "port": 8080
+    },
+    "ui": {
+      "enabled": true
+    }
+  }
+}

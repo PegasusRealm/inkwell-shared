@@ -1,0 +1,222 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Helper function to check if user has coach role
+    function isCoach() {
+      return request.auth != null && 
+             request.auth.uid != null &&
+             (
+               // Primary: Check role in user document
+               isCoachByRole(request.auth.uid) ||
+               // Fallback: Check custom claims (if set)
+               (request.auth.token != null && request.auth.token.coach == true)
+             );
+    }
+
+    // Helper function to check if user has admin role
+    function isAdmin(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid)) &&
+             get(/databases/$(database)/documents/users/$(uid)).data.userRole == "admin";
+    }
+
+    // Helper for role in user document
+    function isCoachByRole(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid)) &&
+             get(/databases/$(database)/documents/users/$(uid)).data.userRole == "coach";
+    }
+
+    // Helper function to check if user has journaler role  
+    function isJournaler(uid) {
+      return exists(/databases/$(database)/documents/users/$(uid)) &&
+             get(/databases/$(database)/documents/users/$(uid)).data.userRole == "journaler";
+    }
+
+   // User profile docs
+    match /users/{userId} {
+      allow read: if request.auth != null && (
+        request.auth.uid == userId ||  // allow self
+        isCoach() ||                   // allow coaches to read user profiles (custom claim)
+        isCoachByRole(request.auth.uid) || // fallback for role-based coaches
+        isAdmin(request.auth.uid)      // allow admins to read user profiles
+      );
+      allow write: if request.auth != null && request.auth.uid == userId;
+      
+      // Allow users to update their practitioner connection fields
+      allow update: if request.auth != null && 
+                       request.auth.uid == userId &&
+                       request.resource.data.diff(resource.data).affectedKeys()
+                         .hasAny(['connectedPractitioner', 'pendingPractitionerInvite']);
+    }
+
+    // FIXED: Single practitionerInvitations rule - allows unauthenticated reading for registration
+    match /practitionerInvitations/{invitationId} {
+      // Allow anyone to read invitation documents (they need the token for registration)
+      allow read: if true;
+      
+      // Allow creating invitations if authenticated and user owns the invitation
+      allow create: if request.auth != null &&
+                    request.resource.data.fromUserId == request.auth.uid;
+      
+      // Allow updating invitations for owners or practitioners
+      allow update: if request.auth != null && (
+        // User can update their own invitations
+        resource.data.fromUserId == request.auth.uid ||
+        // Practitioner can update invitations sent to them
+        resource.data.practitionerEmail == request.auth.token.email
+      );
+    }
+
+    // Manifest docs
+    match /manifests/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // Journal entries
+    match /journalEntries/{entryId} {
+      
+      allow create: if
+        request.auth != null &&
+        (isJournaler(request.auth.uid) || isCoach() || isCoachByRole(request.auth.uid) || isAdmin(request.auth.uid)) &&
+        request.resource.data.userId == request.auth.uid;
+
+      allow update: if
+        request.auth != null &&
+        (
+          // Journaler, coach, or admin can update their own entries (but not protected coach fields)
+          (resource.data.userId == request.auth.uid && 
+           (isJournaler(request.auth.uid) || isCoach() || isCoachByRole(request.auth.uid) || isAdmin(request.auth.uid)) &&
+           (
+             // Allow normal field updates (excluding coach fields)
+             !request.resource.data.diff(resource.data).affectedKeys()
+               .hasAny(['coachResponse', 'newCoachReply', 'coachNotifiedAt', 'lastNotificationHash']) ||
+             // Allow setting newCoachReply to false only (marking as read)
+             (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['newCoachReply']) &&
+              request.resource.data.newCoachReply == false)
+           )) ||
+          
+          // Direct client updates to coach fields are blocked
+          // Coach responses must use saveCoachReply callable function
+          false
+        );
+
+      allow read: if
+        request.auth != null &&
+        (
+          resource.data.userId == request.auth.uid ||
+          (
+            resource.data.coachReview == true &&
+            (isCoach() || isCoachByRole(request.auth.uid))
+          )
+        );
+
+      allow delete: if
+        request.auth != null &&
+        resource.data.userId == request.auth.uid &&
+        (isJournaler(request.auth.uid) || isCoach() || isCoachByRole(request.auth.uid) || isAdmin(request.auth.uid));
+
+      // Coach reply subcollection - allow journaler to read replies to their own entries
+      match /coachReplies/{replyId} {
+        allow read: if request.auth != null &&
+                    (
+                      // Allow journaler to read replies to their own entries
+                      get(/databases/$(database)/documents/journalEntries/$(entryId)).data.userId == request.auth.uid ||
+                      // Allow coaches to read coach replies
+                      (isCoach() || isCoachByRole(request.auth.uid))
+                    );
+
+        allow create: if request.auth != null &&
+                      (isCoach() || isCoachByRole(request.auth.uid)) &&
+                      // Verify coach is assigned to this entry (coachReview must be true)
+                      get(/databases/$(database)/documents/journalEntries/$(entryId)).data.coachReview == true;
+
+        allow update: if request.auth != null &&
+                      (isCoach() || isCoachByRole(request.auth.uid)) &&
+                      // Can only update their own replies
+                      resource.data.coachId == request.auth.uid &&
+                      // Cannot change coachId after creation
+                      request.resource.data.coachId == resource.data.coachId;
+
+        // Allow journaler to delete coach replies when deleting their own entry
+        allow delete: if request.auth != null &&
+                      get(/databases/$(database)/documents/journalEntries/$(entryId)).data.userId == request.auth.uid;
+      }
+    }
+
+    // Top-level coach replies collection (if used)
+    match /coachReplies/{replyId} {
+      allow read: if request.auth != null &&
+                  (resource.data.userId == request.auth.uid ||
+                   (isCoach() || isCoachByRole(request.auth.uid)));
+
+      allow create: if request.auth != null &&
+                    (isCoach() || isCoachByRole(request.auth.uid)) &&
+                    // Verify the referenced entry exists and is marked for coach review
+                    exists(/databases/$(database)/documents/journalEntries/$(resource.data.entryId)) &&
+                    get(/databases/$(database)/documents/journalEntries/$(resource.data.entryId)).data.coachReview == true &&
+                    // Coach can only create replies with their own UID
+                    request.resource.data.coachId == request.auth.uid;
+
+      allow update: if request.auth != null &&
+                    (isCoach() || isCoachByRole(request.auth.uid)) &&
+                    // Can only update their own replies
+                    resource.data.coachId == request.auth.uid &&
+                    // Cannot change critical fields after creation
+                    request.resource.data.coachId == resource.data.coachId &&
+                    request.resource.data.entryId == resource.data.entryId;
+
+      // Allow journaler to delete coach replies when deleting their own entry
+      allow delete: if request.auth != null &&
+                    (
+                      // Allow journaler to delete replies to their own entries
+                      (exists(/databases/$(database)/documents/journalEntries/$(resource.data.entryId)) &&
+                       get(/databases/$(database)/documents/journalEntries/$(resource.data.entryId)).data.userId == request.auth.uid) ||
+                      // Allow coaches to delete their own replies
+                      resource.data.coachId == request.auth.uid
+                    );
+    }
+
+    // FIXED: Single practitionerRequests rule with proper admin access
+    match /practitionerRequests/{requestId} {
+      // Allow creating new practitioner requests if authenticated
+      allow create: if request.auth != null;
+      
+      // Allow reading for multiple cases
+      allow read: if request.auth != null && (
+        // Users can read their own requests
+        request.auth.uid == resource.data.userId ||
+        // Admins can read all practitioner requests (Firestore document check)
+        isAdmin(request.auth.uid) ||
+        // Fallback: custom claims admin access
+        request.auth.token.admin == true
+      );
+      
+      // Allow updating for admins only
+      allow update: if request.auth != null && (
+        isAdmin(request.auth.uid) ||
+        request.auth.token.admin == true
+      );
+    }
+
+    // approvedPractitioners collection
+    match /approvedPractitioners/{practitionerId} {
+      // Allow coaches to read approved practitioners list
+      allow read: if request.auth != null && (
+        isCoach() || 
+        isCoachByRole(request.auth.uid) ||
+        // Allow any authenticated user to read for practitioner selection
+        request.auth.uid != null
+      );
+      
+      // Allow admin to write/manage practitioners
+      allow write: if request.auth != null && (
+        isAdmin(request.auth.uid) ||
+        request.auth.token.admin == true
+      );
+      
+      // Allow practitioners to update their own profiles
+      allow update: if request.auth != null && 
+                       resource.data.email == request.auth.token.email;
+    }
+  }
+}
