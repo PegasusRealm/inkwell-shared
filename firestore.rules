@@ -40,13 +40,8 @@ service cloud.firestore {
         isCoachByRole(request.auth.uid) || // fallback for role-based coaches
         isAdmin(request.auth.uid)      // allow admins to read user profiles
       );
+      // Allow users to write/update all their own data (including phone, smsPreferences, timezone, etc.)
       allow write: if request.auth != null && request.auth.uid == userId;
-      
-      // Allow users to update their practitioner connection fields
-      allow update: if request.auth != null && 
-                       request.auth.uid == userId &&
-                       request.resource.data.diff(resource.data).affectedKeys()
-                         .hasAny(['connectedPractitioner', 'pendingPractitionerInvite']);
     }
 
     // FIXED: Single practitionerInvitations rule - allows unauthenticated reading for registration

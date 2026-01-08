@@ -1987,6 +1987,22 @@ exports.createUserProfile = onCall(async (data, context) => {
   }
   try {
     const result = await createUserProfileIfNotExists(uid, email);
+    
+    // Check if user had requested account deletion and cancel it
+    const userDoc = await admin.firestore().collection('users').doc(uid).get();
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+      if (userData.deletionRequested) {
+        console.log(`🔄 Canceling account deletion for user ${uid} - user logged back in`);
+        await admin.firestore().collection('users').doc(uid).update({
+          deletionRequested: admin.firestore.FieldValue.delete(),
+          deletionScheduledFor: admin.firestore.FieldValue.delete(),
+          deletionCanceledAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+        console.log(`✅ Account deletion canceled for user ${uid}`);
+      }
+    }
+    
     return { success: true, created: result.created };
   } catch (error) {
     console.error("Error creating user profile:", error);
@@ -1994,6 +2010,50 @@ exports.createUserProfile = onCall(async (data, context) => {
       code: 'PROFILE_ERROR', 
       retryable: true 
     });
+  }
+});
+
+/**
+ * Cancel Account Deletion (callable)
+ * Allows users to cancel their deletion request before the 30-day period expires
+ */
+exports.cancelAccountDeletion = onCall(async (data, context) => {
+  const uid = context.auth?.uid;
+  if (!uid) {
+    throw new HttpsError("unauthenticated", "User must be authenticated.");
+  }
+  
+  try {
+    const userRef = admin.firestore().collection('users').doc(uid);
+    const userDoc = await userRef.get();
+    
+    if (!userDoc.exists) {
+      throw new HttpsError("not-found", "User profile not found.");
+    }
+    
+    const userData = userDoc.data();
+    
+    if (!userData.deletionRequested) {
+      return { success: true, message: "No deletion request to cancel." };
+    }
+    
+    // Cancel the deletion
+    await userRef.update({
+      deletionRequested: admin.firestore.FieldValue.delete(),
+      deletionScheduledFor: admin.firestore.FieldValue.delete(),
+      deletionCanceledAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+    
+    console.log(`✅ Account deletion canceled for user ${uid}`);
+    
+    return { 
+      success: true, 
+      message: "Account deletion has been canceled successfully." 
+    };
+    
+  } catch (error) {
+    console.error("Error canceling account deletion:", error);
+    throw new HttpsError("internal", "Failed to cancel account deletion. Please try again.");
   }
 });
 
@@ -4302,8 +4362,8 @@ async function updateUserBehavioralSummary(userId, newBehavior) {
 }
 
 // Simple admin migration endpoint - bypasses client auth issues
-// COMMENTED OUT TO SAVE CPU QUOTA
-/* exports.runAdminMigration = onRequest({
+// Enabled for pre-TestFlight data standardization
+exports.runAdminMigration = onRequest({
   cors: true
 }, async (req, res) => {
   // Simple secret key check instead of Firebase auth
@@ -4329,13 +4389,14 @@ async function updateUserBehavioralSummary(userId, newBehavior) {
         const userData = doc.data();
         const userId = doc.id;
         
-        // Check if user needs migration (missing new fields)
+        // Check if user needs migration (missing new fields OR has photoURL that needs conversion)
         const needsMigration = 
           !userData.userId || 
           !userData.createdAt || 
           userData.special_code === undefined ||
           !userData.insightsPreferences ||
-          !userData.onboardingState;
+          !userData.onboardingState ||
+          (userData.photoURL !== undefined && userData.avatar === undefined); // photoURL -> avatar conversion
         
         if (!needsMigration) {
           skipped++;
@@ -4358,6 +4419,17 @@ async function updateUserBehavioralSummary(userId, newBehavior) {
         
         if (userData.special_code === undefined) {
           migrationData.special_code = "beta";
+        }
+        
+        // Convert photoURL to avatar if needed
+        if (userData.photoURL !== undefined && userData.avatar === undefined) {
+          migrationData.avatar = userData.photoURL || "";
+          // Note: We'll keep photoURL for now but avatar is the canonical field
+        }
+        
+        // Ensure avatar field exists
+        if (userData.avatar === undefined && userData.photoURL === undefined) {
+          migrationData.avatar = "";
         }
         
         if (!userData.insightsPreferences) {
@@ -4429,7 +4501,6 @@ async function updateUserBehavioralSummary(userId, newBehavior) {
     });
   }
 });
-*/
 
 // Delete User Data - Comprehensive account deletion function
 exports.deleteUserData = onRequest({ secrets: [SENDGRID_API_KEY] }, async (req, res) => {
@@ -5087,27 +5158,14 @@ const GRATITUDE_PROMPTS = [
  */
 exports.scheduledDailyPrompts = onSchedule({
   schedule: 'every 3 hours',
-  timeZone: 'America/New_York', // Adjust to your primary timezone
+  timeZone: 'UTC', // Run in UTC so we check all timezones
   secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, ANTHROPIC_API_KEY]
 }, async (event) => {
-  console.log('🕐 Running scheduled daily prompts check...');
+  console.log('🕐 Running scheduled daily prompts check (all timezones)...');
   
   try {
     const now = new Date();
-    const currentHour = now.getHours();
-    
-    // Determine which time window we're in
-    let timeWindow = '';
-    if (currentHour >= 8 && currentHour < 10) timeWindow = 'morning';
-    else if (currentHour >= 12 && currentHour < 14) timeWindow = 'midday';
-    else if (currentHour >= 15 && currentHour < 17) timeWindow = 'afternoon';
-    else if (currentHour >= 19 && currentHour < 21) timeWindow = 'evening';
-    else {
-      console.log('⏰ Outside prompt windows, skipping');
-      return null;
-    }
-    
-    console.log(`📅 Current time window: ${timeWindow}`);
+    console.log(`🌍 UTC time: ${now.toISOString()}`);
     
     // Get all users who need prompts
     const usersSnapshot = await admin.firestore().collection('users').get();
@@ -5122,11 +5180,34 @@ exports.scheduledDailyPrompts = onSchedule({
       // Check base eligibility
       if (!userData.smsOptIn || !userData.phoneNumber) continue;
       
-      // Check if user's time slot matches current window
-      const userTimeSlot = userData.promptTimeSlot || 'morning';
-      if (userTimeSlot !== timeWindow) {
+      // Get user's timezone (default to Pacific/Honolulu for Hawaii users, or America/New_York)
+      const userTimezone = userData.timezone || 'America/New_York';
+      
+      // Get current hour in USER'S timezone
+      const userHour = parseInt(now.toLocaleString('en-US', { 
+        timeZone: userTimezone,
+        hour: 'numeric',
+        hour12: false 
+      }));
+      
+      // Determine which time window the user is in
+      let currentWindow = '';
+      if (userHour >= 8 && userHour < 10) currentWindow = 'morning';
+      else if (userHour >= 12 && userHour < 14) currentWindow = 'midday';
+      else if (userHour >= 15 && userHour < 17) currentWindow = 'afternoon';
+      else if (userHour >= 19 && userHour < 21) currentWindow = 'evening';
+      else {
+        // User is outside prompt windows in their timezone, skip
         continue;
       }
+      
+      // Check if user's preferred time slot matches current window
+      const userTimeSlot = userData.promptTimeSlot || 'morning';
+      if (userTimeSlot !== currentWindow) {
+        continue; // Not their preferred time yet
+      }
+      
+      console.log(`📍 User ${userId} in ${userTimezone}: hour ${userHour} = ${currentWindow} window`);
       
       // =======================================================================
       // JOURNAL PROMPTS
@@ -5175,20 +5256,24 @@ exports.scheduledDailyPrompts = onSchedule({
                 
                 if (!recentEntries.empty) {
                   const recentText = recentEntries.docs
-                    .map(doc => doc.data().entry?.substring(0, 200))
+                    .map(doc => doc.data().text?.substring(0, 200))
+                    .filter(text => text && text.trim())
                     .join(' ');
                   
-                  // Generate personalized prompt
-                  const aiResponse = await callAnthropicWithRetry({
-                    model: "claude-3-haiku-20240307",
-                    max_tokens: 150,
-                    messages: [{
-                      role: "user",
-                      content: `You are Sophy, a supportive journaling assistant. Based on these recent journal excerpts: "${recentText}", generate a single thoughtful journaling prompt (max 100 characters). Respond with ONLY the prompt text, no quotes or prefixes.`
-                    }]
-                  }, "dailyPromptPersonalized", generateRequestId());
-                  
-                  promptText = aiResponse.content[0].text.trim().substring(0, 120);
+                  // Only generate personalized prompt if we have actual text
+                  if (recentText.trim()) {
+                    // Generate personalized prompt
+                    const aiResponse = await callAnthropicWithRetry({
+                      model: "claude-3-haiku-20240307",
+                      max_tokens: 150,
+                      messages: [{
+                        role: "user",
+                        content: `You are Sophy, a warm and encouraging journaling companion. Based on these recent journal entries: "${recentText}", create a thoughtful follow-up journaling prompt (max 100 characters). Be curious and supportive. Respond with ONLY the prompt question, no explanations or apologies.`
+                      }]
+                    }, "dailyPromptPersonalized", generateRequestId());
+                    
+                    promptText = aiResponse.content[0].text.trim().substring(0, 120);
+                  }
                 }
               } catch (error) {
                 console.error('Failed to generate personalized prompt, using generic:', error);
@@ -5255,13 +5340,13 @@ exports.scheduledDailyPrompts = onSchedule({
           }
         }
         
-        // Ensure we don't send both journal and gratitude on same day
+        // Stagger journal and gratitude - don't send both within 6 hours
         const lastJournalSent = userData.lastPromptSent?.toDate?.();
         if (lastJournalSent) {
-          const todayStart = new Date();
-          todayStart.setHours(0, 0, 0, 0);
-          if (lastJournalSent >= todayStart) {
-            shouldSendGratitude = false; // Already sent journal today, skip gratitude
+          const hoursSinceJournal = (now - lastJournalSent) / (1000 * 60 * 60);
+          if (hoursSinceJournal < 6) {
+            shouldSendGratitude = false; // Too soon after journal prompt
+            console.log(`⏳ Skipping gratitude for user ${userId} - journal sent ${hoursSinceJournal.toFixed(1)}h ago`);
           }
         }
         
@@ -5533,10 +5618,60 @@ exports.createCheckoutSession = onCall({
       });
     }
 
-    // Check if gift code provided and valid
-    let discountAmount = 0;
-    let giftData = null;
+    // Determine discount based on role and practitioner selection
+    let discountPercent = 0;
+    let discountReason = '';
+    let isSpecialPractitioner = false;
     
+    // Check for role-based discounts (alpha, beta, coach)
+    const accountType = userData?.accountType || 'standard';
+    const selectedPractitioner = metadata?.practitionerId || null;
+    
+    // Determine tier from priceId
+    let tierName = 'unknown';
+    if (priceId === 'price_1SeRgCI0M1vXVDeSRRA8iYRh') tierName = 'plus';
+    if (priceId === 'price_1SeRgCI0M1vXVDeStsmhHyOz') tierName = 'connect';
+    
+    console.log('🔷 Account type:', accountType, 'Tier:', tierName);
+    
+    // Role-based discounts
+    if (accountType === 'alpha') {
+      if (tierName === 'plus') {
+        discountPercent = 100; // 100% off Plus
+        discountReason = 'Alpha Tester - Plus Free';
+      } else if (tierName === 'connect') {
+        // Check if selecting Hollis Verdant (special 80% off)
+        if (selectedPractitioner === 'hollis-verdant') {
+          discountPercent = 80; // 80% off for Hollis
+          discountReason = 'Alpha Tester - Hollis Verdant (Infrastructure Only)';
+          isSpecialPractitioner = true;
+        } else {
+          discountPercent = 25; // 25% off for other practitioners
+          discountReason = 'Alpha Tester - Connect Discount';
+        }
+      }
+    } else if (accountType === 'beta') {
+      if (tierName === 'plus') {
+        discountPercent = 80; // 80% off Plus
+        discountReason = 'Beta Tester - Plus Discount';
+      } else if (tierName === 'connect') {
+        // Check if selecting Hollis Verdant (special 80% off)
+        if (selectedPractitioner === 'hollis-verdant') {
+          discountPercent = 80; // 80% off for Hollis
+          discountReason = 'Beta Tester - Hollis Verdant (Infrastructure Only)';
+          isSpecialPractitioner = true;
+        } else {
+          discountPercent = 25; // 25% off for other practitioners
+          discountReason = 'Beta Tester - Connect Discount';
+        }
+      }
+    } else if (accountType === 'coach' || userData?.isPractitioner) {
+      discountPercent = 25; // 25% off all tiers for coaches
+      discountReason = 'Mental Health Professional Discount';
+    }
+    
+    // Check for gift code (can override if higher discount)
+    let giftData = null;
     if (giftCode) {
       const giftDoc = await admin.firestore()
         .collection('giftMemberships')
@@ -5558,9 +5693,15 @@ exports.createCheckoutSession = onCall({
           throw new HttpsError('failed-precondition', 'Gift code has already been used');
         }
         
-        discountAmount = giftData.discountPercent; // 0.50 to 1.0
+        const giftDiscount = giftData.discountPercent * 100; // Convert to percent
+        if (giftDiscount > discountPercent) {
+          discountPercent = giftDiscount;
+          discountReason = `Gift from ${giftData.practitionerName || 'practitioner'}`;
+        }
       }
     }
+    
+    console.log('🔷 Final discount:', discountPercent + '%', 'Reason:', discountReason);
 
     // Build session config
     const sessionConfig = {
@@ -5574,6 +5715,10 @@ exports.createCheckoutSession = onCall({
       cancel_url: cancelUrl || `${process.env.APP_URL}/app.html`,
       metadata: {
         firebaseUID: userId,
+        accountType: accountType,
+        discountReason: discountReason || 'none',
+        isSpecialPractitioner: isSpecialPractitioner,
+        ...(selectedPractitioner ? { practitionerId: selectedPractitioner } : {}),
         ...(metadata || {}),
         ...(giftCode ? { giftCode } : {}),
       },
@@ -5584,23 +5729,30 @@ exports.createCheckoutSession = onCall({
       sessionConfig.subscription_data = {
         metadata: {
           firebaseUID: userId,
+          accountType: accountType,
+          discountReason: discountReason || 'none',
+          isSpecialPractitioner: isSpecialPractitioner,
+          ...(selectedPractitioner ? { practitionerId: selectedPractitioner } : {}),
         },
       };
     }
     
     console.log('🔷 Session config:', JSON.stringify(sessionConfig, null, 2));
 
-    // Apply discount if gift code valid
-    if (discountAmount > 0) {
+    // Apply discount if any (role-based or gift code)
+    if (discountPercent > 0) {
       const coupon = await stripe.coupons.create({
-        percent_off: discountAmount * 100,
-        duration: 'forever', // Discount applies for life of subscription
-        name: `Gift from practitioner (${discountAmount * 100}% off)`,
+        percent_off: discountPercent,
+        duration: giftData ? 'repeating' : 'forever', // Gift codes repeat for 3 months, role discounts are forever
+        duration_in_months: giftData ? 3 : undefined, // 3-month duration for gift codes
+        name: discountReason,
       });
       
       sessionConfig.discounts = [{
         coupon: coupon.id,
       }];
+      
+      console.log('✅ Applied discount coupon:', coupon.id, discountPercent + '%');
     }
 
     const session = await stripe.checkout.sessions.create(sessionConfig);
@@ -5680,13 +5832,29 @@ exports.handleStripeWebhook = onRequest({
             });
           }
           
-          // Mark gift code as redeemed
+          // Mark gift code as redeemed and track subscription
           if (giftCode) {
             const giftRef = admin.firestore().collection('giftMemberships').doc(giftCode);
-            await giftRef.update({
-              redeemedBy: admin.firestore.FieldValue.arrayUnion(userId),
-              redeemedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
+            const giftDoc = await giftRef.get();
+            
+            if (giftDoc.exists) {
+              await giftRef.update({
+                redeemedBy: admin.firestore.FieldValue.arrayUnion(userId),
+                activeSubscriptions: admin.firestore.FieldValue.arrayUnion({
+                  userId: userId,
+                  subscriptionId: subscription.id,
+                  redeemedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  expiresAt: new Date(Date.now() + (90 * 24 * 60 * 60 * 1000)), // 3 months from now
+                }),
+              });
+              
+              // Store gift code info on user for tracking
+              await admin.firestore().collection('users').doc(userId).update({
+                giftCodeUsed: giftCode,
+                giftCodeExpiresAt: new Date(Date.now() + (90 * 24 * 60 * 60 * 1000)),
+                giftCodeIssuedBy: giftDoc.data().createdBy,
+              });
+            }
           }
           
           console.log(`✅ Subscription created for user ${userId}: ${tier}`);
@@ -5743,6 +5911,121 @@ exports.handleStripeWebhook = onRequest({
         
         // TODO: Send email notification to user
         console.log(`⚠️ Payment failed for user ${userId}`);
+        break;
+      }
+      
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object;
+        
+        // Only process subscription invoices (not one-time payments)
+        if (!invoice.subscription) break;
+        
+        const subscription = await stripe.subscriptions.retrieve(invoice.subscription);
+        const userId = subscription.metadata.firebaseUID;
+        const accountType = subscription.metadata.accountType || 'standard';
+        const practitionerId = subscription.metadata.practitionerId;
+        const isSpecialPractitioner = subscription.metadata.isSpecialPractitioner === 'true';
+        const discountReason = subscription.metadata.discountReason || 'none';
+        
+        // Determine if this is Connect tier (has practitioner revenue share)
+        const priceId = subscription.items.data[0].price.id;
+        const isConnectTier = priceId === 'price_1SeRgCI0M1vXVDeStsmhHyOz';
+        
+        const amountPaid = invoice.amount_paid / 100; // Convert cents to dollars
+        const stripeFee = (invoice.amount_paid * 0.029 + 30) / 100; // 2.9% + $0.30
+        
+        console.log(`💰 Payment succeeded: $${amountPaid}, Stripe fee: $${stripeFee.toFixed(2)}`);
+        
+        // Calculate revenue split for Connect tier
+        if (isConnectTier && practitionerId && !isSpecialPractitioner) {
+          // Standard practitioner - always gets $30
+          const practitionerShare = 30.00;
+          const platformShare = amountPaid - practitionerShare - stripeFee;
+          
+          console.log(`📊 Revenue split: Practitioner=$${practitionerShare}, Platform=$${platformShare.toFixed(2)}, Stripe=$${stripeFee.toFixed(2)}`);
+          
+          // Record revenue transaction
+          await admin.firestore().collection('revenueTransactions').add({
+            userId: userId,
+            practitionerId: practitionerId,
+            accountType: accountType,
+            discountReason: discountReason,
+            subscriptionId: subscription.id,
+            invoiceId: invoice.id,
+            amountPaid: amountPaid,
+            practitionerShare: practitionerShare,
+            platformShare: platformShare,
+            stripeFee: stripeFee,
+            transactionDate: admin.firestore.FieldValue.serverTimestamp(),
+            periodStart: new Date(subscription.current_period_start * 1000),
+            periodEnd: new Date(subscription.current_period_end * 1000),
+          });
+          
+          // Update practitioner's monthly revenue
+          const monthKey = new Date().toISOString().slice(0, 7); // YYYY-MM
+          const practitionerRef = admin.firestore()
+            .collection('practitioners')
+            .doc(practitionerId);
+          
+          await practitionerRef.set({
+            monthlyRevenue: {
+              [monthKey]: admin.firestore.FieldValue.increment(practitionerShare),
+            },
+            totalRevenue: admin.firestore.FieldValue.increment(practitionerShare),
+            activeClients: admin.firestore.FieldValue.arrayUnion(userId),
+            lastPaymentReceived: admin.firestore.FieldValue.serverTimestamp(),
+          }, { merge: true });
+          
+          console.log(`✅ Practitioner ${practitionerId} credited $${practitionerShare}`);
+          
+        } else if (isConnectTier && isSpecialPractitioner) {
+          // Hollis Verdant - waives practitioner fee
+          const practitionerShare = 0.00;
+          const platformShare = amountPaid - stripeFee;
+          
+          console.log(`📊 Special practitioner (Hollis): Platform=$${platformShare.toFixed(2)}, Stripe=$${stripeFee.toFixed(2)}`);
+          
+          // Still record the transaction
+          await admin.firestore().collection('revenueTransactions').add({
+            userId: userId,
+            practitionerId: practitionerId,
+            accountType: accountType,
+            discountReason: discountReason,
+            isSpecialPractitioner: true,
+            subscriptionId: subscription.id,
+            invoiceId: invoice.id,
+            amountPaid: amountPaid,
+            practitionerShare: practitionerShare,
+            platformShare: platformShare,
+            stripeFee: stripeFee,
+            transactionDate: admin.firestore.FieldValue.serverTimestamp(),
+            periodStart: new Date(subscription.current_period_start * 1000),
+            periodEnd: new Date(subscription.current_period_end * 1000),
+          });
+        } else {
+          // Plus tier or no practitioner - all to platform
+          const platformShare = amountPaid - stripeFee;
+          
+          console.log(`📊 Plus tier: Platform=$${platformShare.toFixed(2)}, Stripe=$${stripeFee.toFixed(2)}`);
+          
+          await admin.firestore().collection('revenueTransactions').add({
+            userId: userId,
+            accountType: accountType,
+            discountReason: discountReason,
+            tier: 'plus',
+            subscriptionId: subscription.id,
+            invoiceId: invoice.id,
+            amountPaid: amountPaid,
+            practitionerShare: 0,
+            platformShare: platformShare,
+            stripeFee: stripeFee,
+            transactionDate: admin.firestore.FieldValue.serverTimestamp(),
+            periodStart: new Date(subscription.current_period_start * 1000),
+            periodEnd: new Date(subscription.current_period_end * 1000),
+          });
+        }
+        
+        console.log(`✅ Revenue split recorded for user ${userId}`);
         break;
       }
     }
@@ -5857,13 +6140,14 @@ exports.purchaseExtraInteraction = onCall({
 /**
  * Create a gift membership code (practitioner only)
  * Allows practitioners to offer discounted Connect memberships to clients
+ * Gift codes valid for 3 months and tied to practitioner connection
  */
 exports.createGiftMembership = onCall({
   cors: true,
 }, async (request) => {
   try {
     const userId = request.auth?.uid;
-    const { discountPercent, maxUses, expirationDays, recipientEmail } = request.data;
+    const { discountPercent, maxUses, recipientEmail } = request.data;
     
     if (!userId) {
       throw new HttpsError('unauthenticated', 'User must be authenticated');
@@ -5879,37 +6163,45 @@ exports.createGiftMembership = onCall({
       throw new HttpsError('permission-denied', 'Only approved practitioners can create gift memberships');
     }
 
+    const practitionerData = practitionerDoc.data();
+
     // Validate discount (50-100%)
     const discount = Math.min(Math.max(discountPercent || 0.50, 0.50), 1.0);
     
     // Generate unique gift code
     const giftCode = generateGiftCode();
     
-    // Calculate expiration
+    // Calculate expiration - FIXED at 3 months (90 days)
     const expiresAt = new Date();
-    expiresAt.setDate(expiresAt.getDate() + (expirationDays || 90));
+    expiresAt.setDate(expiresAt.getDate() + 90);
     
     // Create gift membership document
     await admin.firestore().collection('giftMemberships').doc(giftCode).set({
       code: giftCode,
       createdBy: userId,
-      createdByEmail: practitionerDoc.data().email,
+      createdByEmail: practitionerData.email,
+      practitionerName: practitionerData.fullName || practitionerData.displayName,
       discountPercent: discount,
       maxUses: maxUses || 1,
       recipientEmail: recipientEmail || null,
       redeemedBy: [],
+      activeSubscriptions: [], // Track active subscriptions using this code
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       expiresAt: admin.firestore.Timestamp.fromDate(expiresAt),
+      durationMonths: 3, // 3-month validity from redemption
       status: 'active',
+      requiresPractitionerConnection: true, // Expires if practitioner disconnects
     });
     
-    console.log(`✅ Gift membership created by practitioner ${userId}: ${giftCode} (${discount * 100}% off)`);
+    console.log(`✅ Gift membership created by practitioner ${userId}: ${giftCode} (${discount * 100}% off, 3-month duration)`);
     
     return {
       giftCode,
       discountPercent: discount,
       expiresAt: expiresAt.toISOString(),
+      durationMonths: 3,
       redeemUrl: `${process.env.APP_URL}/redeem?code=${giftCode}`,
+      note: 'Code valid for 3 months from redemption. Expires if practitioner connection is removed.',
     };
     
   } catch (error) {
@@ -6055,6 +6347,414 @@ exports.resetMonthlyInteractions = onSchedule({
   }
 });
 
+/**
+ * Scheduled Account Deletion - GDPR/CCPA Compliance
+ * Runs daily at 2 AM UTC to permanently delete accounts that requested deletion 30+ days ago
+ */
+exports.scheduledAccountDeletion = onSchedule({
+  schedule: 'every day 02:00',
+  timeZone: 'UTC',
+  secrets: []
+}, async (event) => {
+  console.log('🗑️ Running scheduled account deletion check...');
+  
+  try {
+    const now = admin.firestore.Timestamp.now();
+    
+    // Find all users scheduled for deletion where the date has passed
+    const usersToDelete = await admin.firestore()
+      .collection('users')
+      .where('deletionScheduledFor', '<=', now)
+      .where('deletionRequested', '!=', null)
+      .get();
+    
+    if (usersToDelete.empty) {
+      console.log('✅ No accounts scheduled for deletion');
+      return { deletedCount: 0 };
+    }
+    
+    console.log(`📋 Found ${usersToDelete.size} accounts to delete`);
+    let deletedCount = 0;
+    let errors = [];
+    
+    for (const userDoc of usersToDelete.docs) {
+      const userId = userDoc.id;
+      const userData = userDoc.data();
+      
+      try {
+        console.log(`🗑️ Deleting account: ${userId} (${userData.email})`);
+        
+        // Delete all user's journal entries
+        const entriesSnapshot = await admin.firestore()
+          .collection('journalEntries')
+          .where('userId', '==', userId)
+          .get();
+        
+        const entryBatch = admin.firestore().batch();
+        entriesSnapshot.docs.forEach(doc => {
+          entryBatch.delete(doc.ref);
+        });
+        await entryBatch.commit();
+        console.log(`  ✓ Deleted ${entriesSnapshot.size} journal entries`);
+        
+        // Delete user's manifest data
+        const manifestRef = admin.firestore().collection('manifests').doc(userId);
+        const manifestDoc = await manifestRef.get();
+        if (manifestDoc.exists) {
+          await manifestRef.delete();
+          console.log(`  ✓ Deleted manifest data`);
+        }
+        
+        // Delete any practitioner connections
+        const practitionersSnapshot = await admin.firestore()
+          .collection('practitioners')
+          .where('connectedUsers', 'array-contains', userId)
+          .get();
+        
+        const practitionerBatch = admin.firestore().batch();
+        practitionersSnapshot.docs.forEach(doc => {
+          practitionerBatch.update(doc.ref, {
+            connectedUsers: admin.firestore.FieldValue.arrayRemove(userId)
+          });
+        });
+        await practitionerBatch.commit();
+        console.log(`  ✓ Removed from ${practitionersSnapshot.size} practitioner connections`);
+        
+        // Delete user's storage files (if any)
+        try {
+          const bucket = admin.storage().bucket();
+          const [files] = await bucket.getFiles({ prefix: `users/${userId}/` });
+          
+          if (files.length > 0) {
+            await Promise.all(files.map(file => file.delete()));
+            console.log(`  ✓ Deleted ${files.length} storage files`);
+          }
+        } catch (storageError) {
+          console.warn(`  ⚠️ Storage deletion error (non-critical): ${storageError.message}`);
+        }
+        
+        // Delete Firebase Auth account
+        try {
+          await admin.auth().deleteUser(userId);
+          console.log(`  ✓ Deleted Firebase Auth account`);
+        } catch (authError) {
+          console.warn(`  ⚠️ Auth deletion error: ${authError.message}`);
+        }
+        
+        // Finally, delete the user document
+        await admin.firestore().collection('users').doc(userId).delete();
+        console.log(`  ✓ Deleted user document`);
+        
+        deletedCount++;
+        console.log(`✅ Successfully deleted account: ${userId}`);
+        
+      } catch (error) {
+        console.error(`❌ Error deleting account ${userId}:`, error);
+        errors.push({ userId, error: error.message });
+      }
+    }
+    
+    console.log(`\n📊 Account Deletion Summary:`);
+    console.log(`   Total scheduled: ${usersToDelete.size}`);
+    console.log(`   Successfully deleted: ${deletedCount}`);
+    console.log(`   Errors: ${errors.length}`);
+    
+    if (errors.length > 0) {
+      console.error('❌ Deletion errors:', JSON.stringify(errors, null, 2));
+    }
+    
+    return { 
+      success: true, 
+      deletedCount,
+      errorCount: errors.length,
+      errors 
+    };
+    
+  } catch (error) {
+    console.error('❌ Fatal error in scheduled account deletion:', error);
+    throw error;
+  }
+});
+
+/**
+ * Expire Gift Code Discounts - Revenue Protection
+ * Runs daily at 3 AM UTC to remove expired gift code coupons from Stripe subscriptions
+ * Gift codes expire after 3 months OR when user disconnects from practitioner
+ */
+exports.expireGiftCodeDiscounts = onSchedule({
+  schedule: 'every day 03:00',
+  timeZone: 'UTC',
+  secrets: [STRIPE_SECRET_KEY]
+}, async (event) => {
+  console.log('⏰ Running gift code expiration check...');
+  
+  try {
+    const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+    const now = new Date();
+    
+    // Find users with gift codes that have expired
+    const usersWithExpiredGifts = await admin.firestore()
+      .collection('users')
+      .where('giftCodeExpiresAt', '<=', now)
+      .where('giftCodeUsed', '!=', null)
+      .get();
+    
+    if (usersWithExpiredGifts.empty) {
+      console.log('✅ No expired gift codes to process');
+      return { expiredCount: 0 };
+    }
+    
+    console.log(`📋 Found ${usersWithExpiredGifts.size} expired gift codes`);
+    let processedCount = 0;
+    let errors = [];
+    
+    for (const userDoc of usersWithExpiredGifts.docs) {
+      const userId = userDoc.id;
+      const userData = userDoc.data();
+      
+      try {
+        console.log(`⏰ Expiring gift code for user ${userId}`);
+        
+        // Get the subscription
+        const subscriptionId = userData.stripeSubscriptionId;
+        if (!subscriptionId) {
+          console.log(`⚠️ No subscription found for user ${userId}`);
+          continue;
+        }
+        
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+        
+        // Check if subscription has discount
+        if (!subscription.discount) {
+          console.log(`ℹ️ User ${userId} has no active discount`);
+        } else {
+          // Remove the discount
+          await stripe.subscriptions.update(subscriptionId, {
+            discount: null, // Remove discount
+          });
+          console.log(`✅ Removed discount from subscription ${subscriptionId}`);
+        }
+        
+        // Check if user has role-based discount to apply instead
+        const accountType = userData.accountType || 'standard';
+        let newDiscount = null;
+        
+        if (accountType === 'alpha' && userData.subscriptionTier === 'connect') {
+          newDiscount = 25; // 25% for alpha Connect
+        } else if (accountType === 'beta' && userData.subscriptionTier === 'connect') {
+          newDiscount = 25; // 25% for beta Connect
+        } else if (accountType === 'coach') {
+          newDiscount = 25; // 25% for coaches
+        }
+        
+        // Apply role-based discount if exists
+        if (newDiscount) {
+          const coupon = await stripe.coupons.create({
+            percent_off: newDiscount,
+            duration: 'forever',
+            name: `${accountType.charAt(0).toUpperCase() + accountType.slice(1)} Role Discount`,
+          });
+          
+          await stripe.subscriptions.update(subscriptionId, {
+            discount: { coupon: coupon.id },
+          });
+          
+          console.log(`✅ Applied ${newDiscount}% role discount for ${accountType} user ${userId}`);
+        }
+        
+        // Update user document
+        await admin.firestore().collection('users').doc(userId).update({
+          giftCodeUsed: admin.firestore.FieldValue.delete(),
+          giftCodeExpiresAt: admin.firestore.FieldValue.delete(),
+          giftCodeIssuedBy: admin.firestore.FieldValue.delete(),
+          lastDiscountUpdate: admin.firestore.FieldValue.serverTimestamp(),
+        });
+        
+        // TODO: Send email notification about discount expiration
+        
+        processedCount++;
+        
+      } catch (error) {
+        console.error(`❌ Error expiring gift code for ${userId}:`, error);
+        errors.push({ userId, error: error.message });
+      }
+    }
+    
+    console.log(`\n📊 Gift Code Expiration Summary:`);
+    console.log(`   Total expired: ${usersWithExpiredGifts.size}`);
+    console.log(`   Successfully processed: ${processedCount}`);
+    console.log(`   Errors: ${errors.length}`);
+    
+    return { 
+      success: true, 
+      expiredCount: processedCount,
+      errorCount: errors.length,
+      errors 
+    };
+    
+  } catch (error) {
+    console.error('❌ Fatal error in gift code expiration:', error);
+    throw error;
+  }
+});
+
+/**
+ * Check Grace Periods and Auto-Downgrade - Connect Tier Management
+ * Runs daily at 4 AM UTC to check users who disconnected from practitioners
+ * Sends reminder emails on days 7 and 13, auto-downgrades on day 14
+ */
+exports.checkGracePeriods = onSchedule({
+  schedule: 'every day 04:00',
+  timeZone: 'UTC',
+  secrets: [STRIPE_SECRET_KEY]
+}, async (event) => {
+  console.log('⏰ Running grace period check...');
+  
+  try {
+    const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+    const now = new Date();
+    
+    // Find users with expired grace periods (no practitioner connection)
+    const usersInGracePeriod = await admin.firestore()
+      .collection('users')
+      .where('gracePeriodEndsAt', '!=', null)
+      .where('subscriptionTier', '==', 'connect')
+      .get();
+    
+    if (usersInGracePeriod.empty) {
+      console.log('✅ No users in grace period');
+      return { 
+        downgradedCount: 0, 
+        remindersSent: 0,
+        finalWarningsSent: 0 
+      };
+    }
+    
+    console.log(`📋 Found ${usersInGracePeriod.size} users in grace period`);
+    
+    let downgradedCount = 0;
+    let remindersSent = 0;
+    let finalWarningsSent = 0;
+    let errors = [];
+    
+    for (const userDoc of usersInGracePeriod.docs) {
+      const userId = userDoc.id;
+      const userData = userDoc.data();
+      const gracePeriodEnds = userData.gracePeriodEndsAt.toDate();
+      const daysRemaining = Math.ceil((gracePeriodEnds - now) / (1000 * 60 * 60 * 24));
+      
+      try {
+        // Check if user reconnected to a practitioner
+        if (userData.connectedPractitioner) {
+          console.log(`✅ User ${userId} reconnected - clearing grace period`);
+          await admin.firestore().collection('users').doc(userId).update({
+            gracePeriodEndsAt: admin.firestore.FieldValue.delete(),
+            practitionerDisconnectedAt: admin.firestore.FieldValue.delete(),
+          });
+          continue;
+        }
+        
+        // EXPIRED - Auto-downgrade to Plus
+        if (daysRemaining <= 0) {
+          console.log(`⏬ Auto-downgrading user ${userId} (grace period expired)`);
+          
+          const subscriptionId = userData.stripeSubscriptionId;
+          if (!subscriptionId) {
+            console.log(`⚠️ No subscription found for user ${userId}`);
+            continue;
+          }
+          
+          // Get current subscription
+          const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+          
+          // Update to Plus tier price
+          const plusPriceId = 'price_1SeRgCI0M1vXVDeSRRA8iYRh'; // Plus $14.99/mo
+          
+          await stripe.subscriptions.update(subscriptionId, {
+            items: [{
+              id: subscription.items.data[0].id,
+              price: plusPriceId,
+            }],
+            proration_behavior: 'always_invoice', // Prorate the change
+            metadata: {
+              ...subscription.metadata,
+              downgradedFrom: 'connect',
+              downgradedAt: new Date().toISOString(),
+              downgradeReason: 'grace_period_expired',
+            },
+          });
+          
+          console.log(`✅ Stripe subscription downgraded to Plus`);
+          
+          // Update Firestore
+          await admin.firestore().collection('users').doc(userId).update({
+            subscriptionTier: 'plus',
+            gracePeriodEndsAt: admin.firestore.FieldValue.delete(),
+            practitionerDisconnectedAt: admin.firestore.FieldValue.delete(),
+            downgradedAt: admin.firestore.FieldValue.serverTimestamp(),
+            downgradedFrom: 'connect',
+          });
+          
+          // Send downgrade confirmation email
+          await sendGracePeriodEmail(userId, userData.email, 'downgraded', gracePeriodEnds);
+          
+          downgradedCount++;
+          
+        // Day 13 - Final warning (1 day left)
+        } else if (daysRemaining === 1 && !userData.finalWarningEmailSent) {
+          console.log(`⚠️ Sending final warning to user ${userId} (1 day left)`);
+          
+          // Send final warning email
+          await sendGracePeriodEmail(userId, userData.email, 'final', gracePeriodEnds);
+          
+          await admin.firestore().collection('users').doc(userId).update({
+            finalWarningEmailSent: true,
+          });
+          
+          finalWarningsSent++;
+          
+        // Day 7 - Mid-grace reminder (7 days left)
+        } else if (daysRemaining === 7 && !userData.midGraceReminderSent) {
+          console.log(`📬 Sending mid-grace reminder to user ${userId} (7 days left)`);
+          
+          // Send reminder email
+          await sendGracePeriodEmail(userId, userData.email, 'reminder', gracePeriodEnds);
+          
+          await admin.firestore().collection('users').doc(userId).update({
+            midGraceReminderSent: true,
+          });
+          
+          remindersSent++;
+        }
+        
+      } catch (error) {
+        console.error(`❌ Error processing grace period for ${userId}:`, error);
+        errors.push({ userId, error: error.message });
+      }
+    }
+    
+    console.log(`\n📊 Grace Period Summary:`);
+    console.log(`   Users checked: ${usersInGracePeriod.size}`);
+    console.log(`   Auto-downgrades: ${downgradedCount}`);
+    console.log(`   Final warnings sent: ${finalWarningsSent}`);
+    console.log(`   Mid-grace reminders: ${remindersSent}`);
+    console.log(`   Errors: ${errors.length}`);
+    
+    return { 
+      success: true, 
+      downgradedCount,
+      finalWarningsSent,
+      remindersSent,
+      errorCount: errors.length,
+      errors 
+    };
+    
+  } catch (error) {
+    console.error('❌ Fatal error in grace period check:', error);
+    throw error;
+  }
+});
+
 // Helper function to generate unique gift codes
 function generateGiftCode(length = 8) {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // Exclude ambiguous chars
@@ -6064,3 +6764,716 @@ function generateGiftCode(length = 8) {
   }
   return code;
 }
+/**
+ * Disconnect from Practitioner
+ * Handles practitioner disconnection and manages gift code expiration
+ * User has 14-day grace period to reconnect before auto-downgrade to Plus
+ */
+exports.disconnectPractitioner = onCall({
+  cors: true,
+  secrets: [STRIPE_SECRET_KEY],
+}, async (request) => {
+  try {
+    const userId = request.auth?.uid;
+    const { practitionerId } = request.data;
+    
+    if (!userId) {
+      throw new HttpsError('unauthenticated', 'User must be authenticated');
+    }
+    
+    const userDoc = await admin.firestore().collection('users').doc(userId).get();
+    const userData = userDoc.data();
+    
+    console.log(`🔗 User ${userId} disconnecting from practitioner ${practitionerId}`);
+    
+    // Remove practitioner connection
+    await admin.firestore().collection('users').doc(userId).update({
+      connectedPractitioner: admin.firestore.FieldValue.delete(),
+      practitionerDisconnectedAt: admin.firestore.FieldValue.serverTimestamp(),
+      gracePeriodEndsAt: new Date(Date.now() + (14 * 24 * 60 * 60 * 1000)), // 14 days from now
+    });
+    
+    // If user has gift code from this practitioner, expire it immediately
+    if (userData.giftCodeIssuedBy === practitionerId) {
+      const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+      const subscriptionId = userData.stripeSubscriptionId;
+      
+      if (subscriptionId) {
+        // Remove gift code discount
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+        
+        if (subscription.discount) {
+          await stripe.subscriptions.update(subscriptionId, {
+            discount: null,
+          });
+          console.log(`✅ Removed gift code discount from subscription ${subscriptionId}`);
+        }
+        
+        // Apply role-based discount if user qualifies
+        const accountType = userData.accountType || 'standard';
+        let roleDiscount = null;
+        
+        if (accountType === 'alpha' && userData.subscriptionTier === 'connect') {
+          roleDiscount = 25;
+        } else if (accountType === 'beta' && userData.subscriptionTier === 'connect') {
+          roleDiscount = 25;
+        } else if (accountType === 'coach') {
+          roleDiscount = 25;
+        }
+        
+        if (roleDiscount) {
+          const coupon = await stripe.coupons.create({
+            percent_off: roleDiscount,
+            duration: 'forever',
+            name: `${accountType.charAt(0).toUpperCase() + accountType.slice(1)} Discount`,
+          });
+          
+          await stripe.subscriptions.update(subscriptionId, {
+            discount: { coupon: coupon.id },
+          });
+          console.log(`✅ Applied ${roleDiscount}% role discount`);
+        }
+      }
+      
+      // Clear gift code tracking
+      await admin.firestore().collection('users').doc(userId).update({
+        giftCodeUsed: admin.firestore.FieldValue.delete(),
+        giftCodeExpiresAt: admin.firestore.FieldValue.delete(),
+        giftCodeIssuedBy: admin.firestore.FieldValue.delete(),
+      });
+    }
+    
+    // Send initial grace period email (Day 0)
+    const gracePeriodEndDate = new Date(Date.now() + (14 * 24 * 60 * 60 * 1000));
+    await sendGracePeriodEmail(userId, userData.email, 'initial', gracePeriodEndDate);
+    
+    console.log(`✅ Practitioner disconnected. User has 14-day grace period.`);
+    
+    return {
+      success: true,
+      message: 'Practitioner disconnected. You have 14 days to connect with a new practitioner or your account will be downgraded to Plus tier.',
+      gracePeriodEndsAt: gracePeriodEndDate.toISOString(),
+      canReconnect: true,
+    };
+    
+  } catch (error) {
+    console.error('❌ Error disconnecting practitioner:', error);
+    throw new HttpsError('internal', error.message);
+  }
+});
+/**
+ * Helper: Send Grace Period Email Notifications
+ * Sends emails at different stages of the grace period using SendGrid
+ */
+async function sendGracePeriodEmail(userId, email, type, gracePeriodEnds) {
+  try {
+    const apiKey = SENDGRID_API_KEY.value();
+    if (!apiKey) {
+      console.warn('⚠️ SendGrid API key not configured - skipping email');
+      return { sent: false, reason: 'no_api_key' };
+    }
+    
+    sgMail.setApiKey(apiKey);
+    
+    const daysRemaining = Math.ceil((gracePeriodEnds - new Date()) / (1000 * 60 * 60 * 24));
+    const appUrl = process.env.APP_URL || 'https://inkwelljournal.io';
+    
+    let subject, html;
+    
+    switch (type) {
+      case 'initial':
+        subject = '🔔 InkWell: Practitioner Disconnected - 14 Day Grace Period';
+        html = `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #2A6972;">Your Practitioner Has Been Disconnected</h2>
+            <p>Your practitioner connection has been removed from your InkWell Connect subscription.</p>
+            
+            <div style="background: #FFF9E6; padding: 15px; border-left: 4px solid #FFC107; margin: 20px 0;">
+              <strong>⏰ You have 14 days</strong> to reconnect with a practitioner before your Connect subscription is automatically downgraded to Plus tier.
+            </div>
+            
+            <h3>What Happens Next?</h3>
+            <ul>
+              <li><strong>Connect with a new practitioner</strong> within 14 days to keep your Connect tier</li>
+              <li><strong>Manually downgrade</strong> to Plus tier anytime if you prefer</li>
+              <li><strong>Auto-downgrade</strong> on ${gracePeriodEnds.toLocaleDateString()} if no action is taken</li>
+            </ul>
+            
+            <div style="margin: 30px 0;">
+              <a href="${appUrl}/app.html?action=find_practitioner" style="background: #2A6972; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Find a New Practitioner</a>
+            </div>
+            
+            <p style="color: #666; font-size: 14px;">Questions? Contact us at <a href="mailto:support@inkwelljournal.io">support@inkwelljournal.io</a></p>
+          </div>
+        `;
+        break;
+        
+      case 'reminder':
+        subject = '⏰ InkWell: 7 Days Left to Reconnect with a Practitioner';
+        html = `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #2A6972;">Reminder: 7 Days Remaining</h2>
+            <p>You have <strong>${daysRemaining} days left</strong> to connect with a practitioner before your Connect tier is downgraded to Plus.</p>
+            
+            <div style="background: #FFF9E6; padding: 15px; border-left: 4px solid #FFC107; margin: 20px 0;">
+              <strong>Grace period ends:</strong> ${gracePeriodEnds.toLocaleDateString()}
+            </div>
+            
+            <div style="margin: 30px 0;">
+              <a href="${appUrl}/app.html?action=find_practitioner" style="background: #2A6972; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Find a Practitioner Now</a>
+            </div>
+          </div>
+        `;
+        break;
+        
+      case 'final':
+        subject = '⚠️ InkWell: FINAL NOTICE - 1 Day to Reconnect';
+        html = `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #D32F2F;">⚠️ Final Notice: 1 Day Remaining</h2>
+            <p>Your Connect tier will be <strong>downgraded to Plus tomorrow</strong> unless you connect with a practitioner.</p>
+            
+            <div style="background: #FFEBEE; padding: 15px; border-left: 4px solid #D32F2F; margin: 20px 0;">
+              <strong>Last chance!</strong> Downgrade happens on ${gracePeriodEnds.toLocaleDateString()}
+            </div>
+            
+            <div style="margin: 30px 0;">
+              <a href="${appUrl}/app.html?action=find_practitioner" style="background: #D32F2F; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Connect Now</a>
+            </div>
+          </div>
+        `;
+        break;
+        
+      case 'downgraded':
+        subject = '✅ InkWell: Your Subscription Has Been Updated';
+        html = `
+          <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+            <h2 style="color: #2A6972;">Your Subscription Has Been Downgraded to Plus</h2>
+            <p>Since you didn't reconnect with a practitioner within 14 days, your subscription has been automatically downgraded from Connect to Plus tier.</p>
+            
+            <h3>You Still Have:</h3>
+            <ul style="color: #2A6972;">
+              <li>✅ Unlimited AI-powered journaling</li>
+              <li>✅ SMS notifications</li>
+              <li>✅ All InkWell core features</li>
+            </ul>
+            
+            <p><strong>Want to upgrade back to Connect?</strong><br>You can reconnect with a practitioner anytime to restore your Connect tier benefits.</p>
+            
+            <div style="margin: 30px 0;">
+              <a href="${appUrl}/app.html?action=find_practitioner" style="background: #2A6972; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Upgrade to Connect</a>
+            </div>
+          </div>
+        `;
+        break;
+    }
+    
+    const msg = {
+      to: email,
+      from: {
+        email: 'noreply@inkwelljournal.io',
+        name: 'InkWell Journal'
+      },
+      subject,
+      html,
+    };
+    
+    await sgMail.send(msg);
+    console.log(`✅ Grace period email sent: ${type} to ${email}`);
+    
+    return { sent: true, type, email };
+    
+  } catch (error) {
+    console.error('❌ Error sending grace period email:', error);
+    return { sent: false, error: error.message, type };
+  }
+}
+
+/**
+ * ============================================================================
+ * PRACTITIONER VERIFICATION & APPROVAL SYSTEM
+ * ============================================================================
+ */
+
+/**
+ * Approve a practitioner application
+ * Sets accountType to 'coach' (for 25% discount), creates practitioner revenue tracking
+ */
+exports.approvePractitioner = onCall({ secrets: [STRIPE_SECRET_KEY, SENDGRID_API_KEY] }, async (request) => {
+  try {
+    const stripe = new Stripe(STRIPE_SECRET_KEY.value());
+    const { practitionerId } = request.data;
+    const callerId = request.auth?.uid;
+    
+    if (!callerId) {
+      throw new Error('Not authenticated');
+    }
+    
+    // Check if caller is admin (you can customize this check)
+    const adminDoc = await admin.firestore().collection('admins').doc(callerId).get();
+    if (!adminDoc.exists) {
+      throw new Error('Unauthorized - admin access required');
+    }
+    
+    if (!practitionerId) {
+      throw new Error('practitionerId required');
+    }
+    
+    // Get practitioner application
+    const applicationRef = admin.firestore().collection('practitionerApplications').doc(practitionerId);
+    const applicationDoc = await applicationRef.get();
+    
+    if (!applicationDoc.exists) {
+      throw new Error('Practitioner application not found');
+    }
+    
+    const applicationData = applicationDoc.data();
+    
+    // Update user account type to 'coach' for discount eligibility
+    await admin.firestore().collection('users').doc(practitionerId).update({
+      userRole: 'coach',
+      accountType: 'coach',
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    
+    // Create approved practitioner record
+    await admin.firestore().collection('approvedPractitioners').doc(practitionerId).set({
+      userId: practitionerId,
+      status: 'approved',
+      name: applicationData.name || '',
+      email: applicationData.email || '',
+      credentials: applicationData.credentials || '',
+      specialty: applicationData.specialty || '',
+      approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      approvedBy: callerId,
+      monthlyRevenue: 0,
+      totalRevenue: 0,
+      activeClients: 0,
+    });
+    
+    // Update application status
+    await applicationRef.update({
+      status: 'approved',
+      approvedAt: admin.firestore.FieldValue.serverTimestamp(),
+      approvedBy: callerId,
+    });
+    
+    // Create practitioner revenue tracking document
+    await admin.firestore().collection('practitioners').doc(practitionerId).set({
+      userId: practitionerId,
+      name: applicationData.name || '',
+      email: applicationData.email || '',
+      monthlyRevenue: 0,
+      totalRevenue: 0,
+      activeClients: 0,
+      joinedAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    
+    // Send approval email
+    try {
+      const apiKey = SENDGRID_API_KEY.value();
+      if (apiKey) {
+        sgMail.setApiKey(apiKey);
+        
+        const appUrl = process.env.APP_URL || 'https://inkwelljournal.io';
+        
+        const msg = {
+          to: applicationData.email,
+          from: {
+            email: 'noreply@inkwelljournal.io',
+            name: 'InkWell Journal'
+          },
+          subject: '🎉 Welcome to InkWell Practitioner Network!',
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2 style="color: #2A6972;">Congratulations, ${applicationData.name}!</h2>
+              <p>Your practitioner application has been <strong>approved</strong>. Welcome to the InkWell Practitioner Network!</p>
+              
+              <div style="background: #E8F5E9; padding: 15px; border-left: 4px solid #4CAF50; margin: 20px 0;">
+                <strong>✅ You're all set!</strong> Your practitioner portal is now active.
+              </div>
+              
+              <h3>What's Next?</h3>
+              <ul>
+                <li><strong>Access your portal:</strong> Log in to view your dashboard, revenue, and client connections</li>
+                <li><strong>Create gift codes:</strong> Generate 50-100% discount codes for your clients</li>
+                <li><strong>Track earnings:</strong> Monitor your monthly revenue and download 1099s</li>
+                <li><strong>Enjoy 25% off:</strong> Your practitioner discount applies to both Plus and Connect tiers</li>
+              </ul>
+              
+              <div style="margin: 30px 0;">
+                <a href="${appUrl}/practitioner-portal.html" style="background: #2A6972; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; display: inline-block;">Access Your Portal</a>
+              </div>
+              
+              <p style="color: #666; font-size: 14px;">Questions? Contact us at <a href="mailto:support@inkwelljournal.io">support@inkwelljournal.io</a></p>
+            </div>
+          `,
+        };
+        
+        await sgMail.send(msg);
+        console.log(`✅ Approval email sent to ${applicationData.email}`);
+      }
+    } catch (emailError) {
+      console.error('⚠️ Error sending approval email:', emailError);
+      // Don't fail the approval if email fails
+    }
+    
+    return {
+      success: true,
+      practitionerId,
+      accountType: 'coach',
+      message: 'Practitioner approved successfully',
+    };
+    
+  } catch (error) {
+    console.error('❌ Error approving practitioner:', error);
+    throw new Error(`Failed to approve practitioner: ${error.message}`);
+  }
+});
+
+/**
+ * Reject a practitioner application
+ */
+exports.rejectPractitioner = onCall({ secrets: [SENDGRID_API_KEY] }, async (request) => {
+  try {
+    const { practitionerId, reason } = request.data;
+    const callerId = request.auth?.uid;
+    
+    if (!callerId) {
+      throw new Error('Not authenticated');
+    }
+    
+    // Check if caller is admin
+    const adminDoc = await admin.firestore().collection('admins').doc(callerId).get();
+    if (!adminDoc.exists) {
+      throw new Error('Unauthorized - admin access required');
+    }
+    
+    if (!practitionerId) {
+      throw new Error('practitionerId required');
+    }
+    
+    // Get practitioner application
+    const applicationRef = admin.firestore().collection('practitionerApplications').doc(practitionerId);
+    const applicationDoc = await applicationRef.get();
+    
+    if (!applicationDoc.exists) {
+      throw new Error('Practitioner application not found');
+    }
+    
+    const applicationData = applicationDoc.data();
+    
+    // Update application status
+    await applicationRef.update({
+      status: 'rejected',
+      rejectedAt: admin.firestore.FieldValue.serverTimestamp(),
+      rejectedBy: callerId,
+      rejectionReason: reason || 'Application did not meet requirements',
+    });
+    
+    // Send rejection email
+    try {
+      const apiKey = SENDGRID_API_KEY.value();
+      if (apiKey) {
+        sgMail.setApiKey(apiKey);
+        
+        const msg = {
+          to: applicationData.email,
+          from: {
+            email: 'noreply@inkwelljournal.io',
+            name: 'InkWell Journal'
+          },
+          subject: 'InkWell Practitioner Application Update',
+          html: `
+            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+              <h2 style="color: #2A6972;">Thank You for Your Interest</h2>
+              <p>Thank you for applying to join the InkWell Practitioner Network. After careful review, we are unable to approve your application at this time.</p>
+              
+              ${reason ? `<div style="background: #FFF9E6; padding: 15px; border-left: 4px solid #FFC107; margin: 20px 0;">
+                <strong>Reason:</strong> ${reason}
+              </div>` : ''}
+              
+              <p>You are welcome to reapply in the future if your qualifications or circumstances change.</p>
+              
+              <p style="color: #666; font-size: 14px;">Questions? Contact us at <a href="mailto:support@inkwelljournal.io">support@inkwelljournal.io</a></p>
+            </div>
+          `,
+        };
+        
+        await sgMail.send(msg);
+        console.log(`✅ Rejection email sent to ${applicationData.email}`);
+      }
+    } catch (emailError) {
+      console.error('⚠️ Error sending rejection email:', emailError);
+    }
+    
+    return {
+      success: true,
+      practitionerId,
+      message: 'Practitioner rejected',
+    };
+    
+  } catch (error) {
+    console.error('❌ Error rejecting practitioner:', error);
+    throw new Error(`Failed to reject practitioner: ${error.message}`);
+  }
+});
+
+/**
+ * Get pending practitioner applications (admin only)
+ */
+exports.getPendingPractitioners = onCall({}, async (request) => {
+  try {
+    const callerId = request.auth?.uid;
+    
+    if (!callerId) {
+      throw new Error('Not authenticated');
+    }
+    
+    // Check if caller is admin
+    const adminDoc = await admin.firestore().collection('admins').doc(callerId).get();
+    if (!adminDoc.exists) {
+      throw new Error('Unauthorized - admin access required');
+    }
+    
+    // Get pending applications
+    const pendingSnapshot = await admin.firestore()
+      .collection('practitionerApplications')
+      .where('status', '==', 'pending')
+      .orderBy('createdAt', 'desc')
+      .get();
+    
+    const applications = [];
+    pendingSnapshot.forEach(doc => {
+      applications.push({
+        id: doc.id,
+        ...doc.data(),
+      });
+    });
+    
+    return { success: true, applications };
+    
+  } catch (error) {
+    console.error('❌ Error getting pending practitioners:', error);
+    throw new Error(`Failed to get pending practitioners: ${error.message}`);
+  }
+});
+
+// ===================================================================
+// STRIPE CONNECT - Practitioner Payment Integration
+// ===================================================================
+
+/**
+ * Create Stripe Connect Express account for practitioner
+ * This allows practitioners to receive their $30/month revenue share
+ */
+exports.createStripeConnectAccount = onCall(
+  {
+    secrets: [STRIPE_SECRET_KEY],
+    region: "us-central1",
+  },
+  async (request) => {
+    const userId = request.auth?.uid;
+    
+    if (!userId) {
+      throw new HttpsError('unauthenticated', 'User must be authenticated');
+    }
+
+    try {
+      console.log('🏦 Creating Stripe Connect account for user:', userId);
+      
+      // Verify user is an approved practitioner
+      const userDoc = await admin.firestore().collection('users').doc(userId).get();
+      const userData = userDoc.data();
+      
+      if (!userData) {
+        throw new HttpsError('not-found', 'User profile not found');
+      }
+      
+      const isPractitioner = userData.accountType === 'coach' || userData.userRole === 'coach';
+      if (!isPractitioner) {
+        throw new HttpsError('permission-denied', 'Only approved practitioners can create Connect accounts');
+      }
+      
+      // Check if Connect account already exists
+      const practitionerDoc = await admin.firestore()
+        .collection('practitioners')
+        .doc(userId)
+        .get();
+      
+      if (practitionerDoc.exists && practitionerDoc.data().stripeConnectAccountId) {
+        console.log('✅ Connect account already exists:', practitionerDoc.data().stripeConnectAccountId);
+        return {
+          success: true,
+          accountId: practitionerDoc.data().stripeConnectAccountId,
+          alreadyExists: true
+        };
+      }
+      
+      // Initialize Stripe
+      const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+      
+      // Create Stripe Connect Express account
+      const account = await stripe.accounts.create({
+        type: 'express',
+        country: 'US',
+        email: userData.email,
+        capabilities: {
+          card_payments: { requested: true },
+          transfers: { requested: true },
+        },
+        business_type: 'individual',
+        metadata: {
+          practitionerId: userId,
+          practitionerEmail: userData.email,
+          practitionerName: userData.displayName || userData.email,
+        }
+      });
+      
+      console.log('✅ Created Stripe Connect account:', account.id);
+      
+      // Store Connect account ID in practitioners collection
+      await admin.firestore().collection('practitioners').doc(userId).set({
+        stripeConnectAccountId: account.id,
+        stripeConnectStatus: 'pending',
+        stripeConnectCreatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      
+      return {
+        success: true,
+        accountId: account.id,
+        alreadyExists: false
+      };
+      
+    } catch (error) {
+      console.error('❌ Error creating Stripe Connect account:', error);
+      throw new HttpsError('internal', `Failed to create Connect account: ${error.message}`);
+    }
+  }
+);
+
+/**
+ * Generate Stripe Connect onboarding link for practitioner
+ * Returns URL to complete Express account setup
+ */
+exports.createStripeConnectOnboardingLink = onCall(
+  {
+    secrets: [STRIPE_SECRET_KEY],
+    region: "us-central1",
+  },
+  async (request) => {
+    const userId = request.auth?.uid;
+    
+    if (!userId) {
+      throw new HttpsError('unauthenticated', 'User must be authenticated');
+    }
+
+    try {
+      console.log('🔗 Creating onboarding link for user:', userId);
+      
+      // Get practitioner's Connect account ID
+      const practitionerDoc = await admin.firestore()
+        .collection('practitioners')
+        .doc(userId)
+        .get();
+      
+      if (!practitionerDoc.exists || !practitionerDoc.data().stripeConnectAccountId) {
+        throw new HttpsError('failed-precondition', 'No Connect account found. Create account first.');
+      }
+      
+      const accountId = practitionerDoc.data().stripeConnectAccountId;
+      
+      // Initialize Stripe
+      const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+      
+      // Create account link for onboarding
+      const accountLink = await stripe.accountLinks.create({
+        account: accountId,
+        refresh_url: 'https://inkwell-alpha.web.app/practitioner-portal.html?refresh=true',
+        return_url: 'https://inkwell-alpha.web.app/practitioner-portal.html?setup=complete',
+        type: 'account_onboarding',
+      });
+      
+      console.log('✅ Created onboarding link:', accountLink.url);
+      
+      return {
+        success: true,
+        url: accountLink.url
+      };
+      
+    } catch (error) {
+      console.error('❌ Error creating onboarding link:', error);
+      throw new HttpsError('internal', `Failed to create onboarding link: ${error.message}`);
+    }
+  }
+);
+
+/**
+ * Check Stripe Connect account status
+ * Returns whether account is fully onboarded and can receive payouts
+ */
+exports.checkStripeConnectStatus = onCall(
+  {
+    secrets: [STRIPE_SECRET_KEY],
+    region: "us-central1",
+  },
+  async (request) => {
+    const userId = request.auth?.uid;
+    
+    if (!userId) {
+      throw new HttpsError('unauthenticated', 'User must be authenticated');
+    }
+
+    try {
+      console.log('🔍 Checking Connect status for user:', userId);
+      
+      // Get practitioner's Connect account ID
+      const practitionerDoc = await admin.firestore()
+        .collection('practitioners')
+        .doc(userId)
+        .get();
+      
+      if (!practitionerDoc.exists || !practitionerDoc.data().stripeConnectAccountId) {
+        return {
+          hasAccount: false,
+          isComplete: false
+        };
+      }
+      
+      const accountId = practitionerDoc.data().stripeConnectAccountId;
+      
+      // Initialize Stripe
+      const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+      
+      // Retrieve account details
+      const account = await stripe.accounts.retrieve(accountId);
+      
+      // Check if charges and payouts are enabled
+      const isComplete = account.charges_enabled && account.payouts_enabled;
+      
+      console.log(`✅ Connect status - Charges: ${account.charges_enabled}, Payouts: ${account.payouts_enabled}`);
+      
+      // Update Firestore with current status
+      await admin.firestore().collection('practitioners').doc(userId).update({
+        stripeConnectStatus: isComplete ? 'active' : 'pending',
+        stripeConnectChargesEnabled: account.charges_enabled,
+        stripeConnectPayoutsEnabled: account.payouts_enabled,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      
+      return {
+        hasAccount: true,
+        isComplete: isComplete,
+        chargesEnabled: account.charges_enabled,
+        payoutsEnabled: account.payouts_enabled,
+        detailsSubmitted: account.details_submitted,
+      };
+      
+    } catch (error) {
+      console.error('❌ Error checking Connect status:', error);
+      throw new HttpsError('internal', `Failed to check Connect status: ${error.message}`);
+    }
+  }
+);
