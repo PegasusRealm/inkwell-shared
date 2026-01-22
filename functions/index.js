@@ -1599,7 +1599,7 @@ exports.saveCoachReplyHTTP = onRequest({
             if (userData.smsOptIn && userData.phoneNumber && userData.smsPreferences?.coachReplies) {
               // Get coach's name
               const coachDoc = await admin.firestore().collection("users").doc(coachUid).get();
-              const coachName = coachDoc.exists ? coachDoc.data().displayName || 'Your practitioner' : 'Your practitioner';
+              const coachName = coachDoc.exists ? coachDoc.data().displayName || 'Your coach' : 'Your coach';
               
               // Send SMS
               const twilio = require('twilio');
@@ -1629,7 +1629,7 @@ exports.saveCoachReplyHTTP = onRequest({
     } catch (error) {
       console.error("❌ Error saving coach reply:", error);
       res.status(500).json({ 
-        error: 'Unable to save the practitioner reply right now. Please try again.',
+        error: 'Unable to save the coach reply right now. Please try again.',
         code: 'SAVE_ERROR',
         retryable: true 
       });
@@ -1878,7 +1878,7 @@ exports.notifyCoachOfTaggedEntry = onRequest({ secrets: [SENDGRID_API_KEY] }, as
     const msg = {
       to: coachEmail,
       from: "support@inkwelljournal.io",
-      subject: "New Journal Entry Tagged for Practitioner Review",
+      subject: "New Journal Entry Tagged for Coach Review",
       text: `Hi,
 
 A new journal entry was tagged for your review on ${dateStr}.
@@ -2237,29 +2237,19 @@ exports.sendPractitionerInvitation = onRequest({ secrets: [SENDGRID_API_KEY] }, 
     sgMail.setApiKey(apiKey);
 
     const { practitionerEmail, practitionerName } = req.body;
+    
+    console.log('📧 Coach invitation request received:', { practitionerEmail, practitionerName, fromUser: userName });
 
     // Create unique invitation token
     const invitationToken = Math.random().toString(36).substring(2, 15) + 
                            Math.random().toString(36).substring(2, 15);
-
-    // Save invitation to Firestore
-    await admin.firestore().collection("practitionerInvitations").doc(invitationToken).set({
-      fromUserId: userId,
-      fromUserName: userName,
-      fromUserEmail: userData.email,
-      practitionerEmail: practitionerEmail,
-      practitionerName: practitionerName,
-      status: 'pending',
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: admin.firestore.FieldValue.serverTimestamp() // Add 30 days in production
-    });
 
     const registrationUrl = `https://inkwelljournal.io/practitioner-register.html?token=${invitationToken}`;
 
     const emailContent = {
       to: practitionerEmail,
       from: "support@inkwelljournal.io",
-      subject: `${userName} has invited you to InkWell - Professional Mental Health Journaling Platform`,
+      subject: `${userName} has invited you to InkWell - Wellness Journaling Platform`,
       html: `
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
           <div style="text-align: center; margin-bottom: 30px;">
@@ -2271,22 +2261,22 @@ exports.sendPractitionerInvitation = onRequest({ secrets: [SENDGRID_API_KEY] }, 
           <p style="font-size: 16px; line-height: 1.6;">Hello ${practitionerName},</p>
           
           <p style="font-size: 16px; line-height: 1.6;">
-            <strong>${userName}</strong> (${userData.email}) has invited you to join InkWell as their practitioner. 
-            InkWell is a professional mental health journaling platform that connects clients with their practitioners.
+            <strong>${userName}</strong> (${userData.email}) has invited you to join InkWell as their coach. 
+            InkWell is a wellness journaling platform that connects clients with their coaches.
           </p>
           
           <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #2A6972;">
             <h3 style="margin-top: 0; color: #2A6972;">What is InkWell?</h3>
             <ul style="margin: 10px 0;">
-              <li>Evidence-based journaling & manifesting platform for mental health and wellness</li>
-              <li>Secure communication between clients and practitioners</li>
+              <li>Evidence-based journaling & manifesting platform for wellness and personal growth</li>
+              <li>Secure communication between clients and coaches</li>
               <li>Custom built wellness and growth AI-assisted reflection tools (Sophy) to support clients</li>
-              <li>Built by mental health professionals for mental health professionals</li>
+              <li>Built by wellness professionals for wellness professionals</li>
             </ul>
           </div>
           
           <p style="font-size: 16px; line-height: 1.6;">
-            To get started and connect with ${userName}, please complete your practitioner registration:
+            To get started and connect with ${userName}, please complete your coach registration:
           </p>
           
           <div style="text-align: center; margin: 30px 0;">
@@ -2305,21 +2295,48 @@ exports.sendPractitionerInvitation = onRequest({ secrets: [SENDGRID_API_KEY] }, 
           
           <p style="font-size: 12px; color: #999; text-align: center;">
             InkWell by Pegasus Realm LLC<br>
-            Professional Mental Health Journaling Platform<br>
+            Wellness Journaling Platform<br>
             <a href="https://www.inkwelljournal.io">inkwelljournal.io</a>
           </p>
         </div>
       `
     };
 
-    await sgMail.send(emailContent);
-    console.log('✅ Practitioner invitation sent to:', practitionerEmail);
+    console.log('📤 Sending email via SendGrid to:', practitionerEmail);
+    
+    try {
+      await sgMail.send(emailContent);
+      console.log('✅ Coach invitation email sent successfully to:', practitionerEmail);
+    } catch (sendError) {
+      console.error('❌ SendGrid email failed:', sendError.message);
+      if (sendError.response) {
+        console.error('❌ SendGrid response body:', sendError.response.body);
+      }
+      throw sendError; // Re-throw to trigger error response
+    }
+    
+    // Calculate expiration date (30 days from now)
+    const expirationDate = new Date();
+    expirationDate.setDate(expirationDate.getDate() + 30);
+    
+    // Only save to Firestore AFTER email succeeds
+    await admin.firestore().collection("practitionerInvitations").doc(invitationToken).set({
+      fromUserId: userId,
+      fromUserName: userName,
+      fromUserEmail: userData.email,
+      practitionerEmail: practitionerEmail,
+      practitionerName: practitionerName,
+      status: 'pending',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt: expirationDate
+    });
+    console.log('💾 Invitation saved to Firestore with token:', invitationToken, 'expires:', expirationDate);
 
     res.json({ success: true, message: 'Invitation sent successfully' });
 
   } catch (error) {
     console.error('❌ Error sending practitioner invitation:', error);
-    res.status(500).json({ error: 'Failed to send invitation' });
+    res.status(500).json({ error: 'Failed to send invitation: ' + error.message });
   }
 });
 
@@ -3067,8 +3084,8 @@ async function getUserDataForPeriod(userId, period) {
       totalWords: journalEntries.reduce((sum, entry) => 
         sum + (entry.content?.split(/\s+/).length || 0), 0),
       daysActive: new Set([
-        ...journalEntries.map(e => e.createdAt?.toDateString()),
-        ...manifestEntries.map(e => e.createdAt?.toDateString())
+        ...journalEntries.map(e => e.createdAt?.toDate?.()?.toDateString?.() || e.createdAt?.toDateString?.()),
+        ...manifestEntries.map(e => e.createdAt?.toDate?.()?.toDateString?.() || e.createdAt?.toDateString?.())
       ].filter(Boolean)).size,
       periodDays: period === 'weekly' ? 7 : 30
     };
@@ -3087,12 +3104,20 @@ async function generateInsightsWithOpenAI(journalEntries, manifestEntries, stats
   console.log(`[${requestId}] Generating ${period} insights for ${userName} with ${stats.totalJournalEntries} journal entries and ${stats.totalManifestEntries} manifest entries`);
   
   // Create content summary (heavily limited to prevent token overflow)
+  // Helper to safely get date string from Firestore Timestamp or Date
+  const getDateString = (timestamp) => {
+    if (!timestamp) return 'Unknown date';
+    if (timestamp.toDate) return timestamp.toDate().toDateString(); // Firestore Timestamp
+    if (timestamp.toDateString) return timestamp.toDateString(); // JavaScript Date
+    return 'Unknown date';
+  };
+  
   const journalContent = journalEntries.slice(0, 5) // Limit to 5 most recent entries
-    .map(entry => `Date: ${entry.createdAt?.toDateString()}\nEntry: ${entry.content?.substring(0, 200) || ''}`) // Reduced from 600 to 200 chars
+    .map(entry => `Date: ${getDateString(entry.createdAt)}\nEntry: ${entry.content?.substring(0, 200) || ''}`) // Reduced from 600 to 200 chars
     .join('\n\n---\n\n');
     
   const manifestContent = manifestEntries.slice(0, 3) // Limit to 3 most recent manifests  
-    .map(entry => `Date: ${entry.createdAt?.toDateString()}\nWish: ${entry.wish?.substring(0, 150) || ''}\nGratitude: ${entry.gratitude?.substring(0, 150) || ''}`) // Reduced from 300 to 150 chars
+    .map(entry => `Date: ${getDateString(entry.createdAt)}\nWish: ${entry.wish?.substring(0, 150) || ''}\nGratitude: ${entry.gratitude?.substring(0, 150) || ''}`) // Reduced from 300 to 150 chars
     .join('\n\n---\n\n');
   
   // Different prompts for weekly vs monthly to ensure different content
@@ -3647,19 +3672,23 @@ async function processWeeklyInsights(requestId) {
   console.log(`[${requestId}] 🚀 Starting weekly insights processing`);
   
   try {
-    // Get all users who have weekly insights enabled
+    // Get ALL users then filter in code (more reliable than nested field queries)
     const usersRef = admin.firestore().collection('users');
-    const usersSnapshot = await usersRef
-      .where('insightsPreferences.weeklyEnabled', '==', true)
-      .get();
+    const usersSnapshot = await usersRef.get();
     
-    console.log(`[${requestId}] Found ${usersSnapshot.size} users with weekly insights enabled`);
+    // Filter to users with weekly insights enabled
+    const eligibleUsers = usersSnapshot.docs.filter(doc => {
+      const data = doc.data();
+      return data.insightsPreferences?.weeklyEnabled === true;
+    });
+    
+    console.log(`[${requestId}] Found ${eligibleUsers.length} users with weekly insights enabled (out of ${usersSnapshot.size} total)`);
     
     const processedUsers = [];
     const errors = [];
     
-    // Process each user sequentially to avoid overwhelming APIs
-    for (const userDoc of usersSnapshot.docs) {
+    // Process each eligible user sequentially to avoid overwhelming APIs
+    for (const userDoc of eligibleUsers) {
       const userId = userDoc.id;
       const userData = userDoc.data();
       const userEmail = userData.email;
@@ -3885,6 +3914,97 @@ async function ghostFreeWeeklyInsights(requestId) {
     throw error;
   }
 }
+
+// Admin callable function to test insights for a specific user
+exports.testInsightsForUser = onCall({
+  secrets: [OPENAI_API_KEY, SENDGRID_API_KEY]
+}, async (request) => {
+  const requestId = generateRequestId();
+  
+  // Verify admin
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Must be authenticated');
+  }
+  
+  const adminDoc = await admin.firestore().collection('users').doc(request.auth.uid).get();
+  if (!adminDoc.exists || adminDoc.data().userRole !== 'admin') {
+    throw new HttpsError('permission-denied', 'Must be admin');
+  }
+  
+  const targetEmail = request.data.email;
+  const period = request.data.period || 'weekly'; // 'weekly' or 'monthly'
+  
+  if (!targetEmail) {
+    throw new HttpsError('invalid-argument', 'Email is required');
+  }
+  
+  console.log(`[${requestId}] 🧪 Admin testing ${period} insights for ${targetEmail}`);
+  
+  try {
+    // Find user by email
+    const usersSnap = await admin.firestore().collection('users')
+      .where('email', '==', targetEmail)
+      .get();
+    
+    if (usersSnap.empty) {
+      return { success: false, error: `User not found: ${targetEmail}` };
+    }
+    
+    const userDoc = usersSnap.docs[0];
+    const userData = userDoc.data();
+    const userId = userDoc.id;
+    const userName = userData.displayName || userData.signupUsername || 'Friend';
+    
+    console.log(`[${requestId}] Found user ${userId}`);
+    console.log(`[${requestId}] insightsPreferences:`, JSON.stringify(userData.insightsPreferences));
+    
+    // Check preferences
+    const prefKey = period === 'weekly' ? 'weeklyEnabled' : 'monthlyEnabled';
+    const isEnabled = userData.insightsPreferences?.[prefKey];
+    console.log(`[${requestId}] ${prefKey}: ${isEnabled}`);
+    
+    // Collect weekly/monthly data (use weekly collector, period affects email template)
+    console.log(`[${requestId}] Collecting user data...`);
+    const data = await collectWeeklyUserData(userId, requestId);
+    
+    console.log(`[${requestId}] Data collected:`, data.stats);
+    
+    if (data.stats.totalEntries === 0) {
+      return { 
+        success: false, 
+        error: 'No journal entries found for this period',
+        insightsPreferences: userData.insightsPreferences,
+        stats: data.stats
+      };
+    }
+    
+    // Generate insights
+    console.log(`[${requestId}] Generating insights...`);
+    const insights = await generateInsightsWithOpenAI(
+      data.journalEntries,
+      data.manifestEntries,
+      data.stats,
+      period,
+      userName,
+      requestId
+    );
+    
+    // Send email
+    console.log(`[${requestId}] Sending email to ${targetEmail}...`);
+    await sendInsightsEmail(targetEmail, insights, period, userName);
+    
+    return {
+      success: true,
+      message: `${period} insights sent to ${targetEmail}`,
+      insightsPreferences: userData.insightsPreferences,
+      stats: data.stats
+    };
+    
+  } catch (error) {
+    console.error(`[${requestId}] Test failed:`, error);
+    return { success: false, error: error.message };
+  }
+});
 
 // Manual trigger for testing weekly insights (hidden button in production)
 // COMMENTED OUT TO SAVE CPU QUOTA
@@ -4905,6 +5025,33 @@ exports.sendWishMilestone = onCall(
     }
 
     try {
+      // Server-side deduplication: Check if we've sent this milestone to this phone number this week
+      const now = new Date();
+      const weekStart = new Date(now);
+      weekStart.setDate(now.getDate() - now.getDay()); // Start of week (Sunday)
+      const weekKey = weekStart.toISOString().split('T')[0]; // YYYY-MM-DD of week start
+      const dedupeKey = `sms_${phoneNumber.replace(/\D/g, '')}_${milestone}_week_${weekKey}`;
+      
+      const dedupeRef = admin.firestore().collection('smsDeduplication').doc(dedupeKey);
+      const dedupeSnap = await dedupeRef.get();
+      
+      if (dedupeSnap.exists) {
+        console.log(`⚠️ Duplicate SMS blocked: ${dedupeKey} already sent this week`);
+        return {
+          success: true,
+          deduplicated: true,
+          message: 'SMS already sent for this milestone this week'
+        };
+      }
+      
+      // Mark as sent BEFORE sending to prevent race conditions
+      await dedupeRef.set({
+        phoneNumber: phoneNumber,
+        milestone: milestone,
+        sentAt: admin.firestore.FieldValue.serverTimestamp(),
+        userId: request.auth.uid
+      });
+      
       const twilio = require('twilio');
       const client = twilio(
         TWILIO_ACCOUNT_SID.value(),
@@ -7728,4 +7875,393 @@ exports.upgradeAllUsersToPlus = onRequest({
       error: error.message 
     });
   }
+});
+
+/**
+ * Monthly Insurance Expiration Check
+ * Runs on the 1st of every month at 9 AM ET
+ * - Finds coaches with insurance expiring within 60 days
+ * - Sends warning emails to coaches
+ * - Updates admin portal with expiring insurance list
+ */
+exports.checkExpiringInsurance = onSchedule({
+  schedule: '0 9 1 * *', // 9 AM on 1st of every month
+  timeZone: 'America/New_York',
+  secrets: [SENDGRID_API_KEY]
+}, async (event) => {
+  console.log('🔍 Running monthly insurance expiration check...');
+  
+  try {
+    sgMail.setApiKey(SENDGRID_API_KEY.value());
+    
+    const now = new Date();
+    const sixtyDaysFromNow = new Date(now.getTime() + (60 * 24 * 60 * 60 * 1000));
+    
+    // Find all approved coaches
+    const coachesSnapshot = await admin.firestore()
+      .collection('users')
+      .where('userRole', '==', 'practitioner')
+      .get();
+    
+    console.log(`📋 Found ${coachesSnapshot.size} coaches to check`);
+    
+    const expiringCoaches = [];
+    const warningsSent = [];
+    const errors = [];
+    
+    for (const coachDoc of coachesSnapshot.docs) {
+      const coach = coachDoc.data();
+      
+      // Get their latest insurance record
+      const insuranceSnapshot = await admin.firestore()
+        .collection('coachInsuranceRecords')
+        .where('coachId', '==', coachDoc.id)
+        .where('status', '==', 'current')
+        .orderBy('uploadedAt', 'desc')
+        .limit(1)
+        .get();
+      
+      if (insuranceSnapshot.empty) {
+        console.log(`⚠️ No insurance record found for coach ${coach.email}`);
+        continue;
+      }
+      
+      const insuranceData = insuranceSnapshot.docs[0].data();
+      const expirationDate = insuranceData.expirationDate ? new Date(insuranceData.expirationDate) : null;
+      
+      if (!expirationDate) {
+        console.log(`⚠️ No expiration date for coach ${coach.email}`);
+        continue;
+      }
+      
+      // Check if expiring within 60 days
+      if (expirationDate <= sixtyDaysFromNow) {
+        const daysUntilExpiration = Math.ceil((expirationDate - now) / (24 * 60 * 60 * 1000));
+        
+        expiringCoaches.push({
+          coachId: coachDoc.id,
+          email: coach.email,
+          name: coach.displayName || coach.email,
+          expirationDate: expirationDate.toISOString(),
+          daysUntilExpiration
+        });
+        
+        // Send warning email if not already sent this month
+        const lastWarningKey = `insuranceWarning_${now.getFullYear()}_${now.getMonth()}`;
+        if (!coach[lastWarningKey]) {
+          try {
+            const msg = {
+              to: coach.email,
+              from: {
+                email: 'support@inkwelljournal.io',
+                name: 'InkWell Support'
+              },
+              subject: `Action Required: Your Insurance Expires in ${daysUntilExpiration} Days`,
+              html: `
+                <div style="font-family: 'Georgia', serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+                  <div style="background: linear-gradient(135deg, #2A6972 0%, #1e4d54 100%); padding: 30px; border-radius: 12px 12px 0 0; text-align: center;">
+                    <h1 style="color: white; margin: 0; font-size: 28px;">Insurance Update Required</h1>
+                  </div>
+                  <div style="background: #f9f6f1; padding: 30px; border-radius: 0 0 12px 12px;">
+                    <p style="color: #2d3748; font-size: 16px; line-height: 1.6;">
+                      Hi ${coach.displayName || 'Coach'},
+                    </p>
+                    <p style="color: #2d3748; font-size: 16px; line-height: 1.6;">
+                      Our records show your coaching insurance will expire on <strong>${expirationDate.toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}</strong> 
+                      (${daysUntilExpiration} days from now).
+                    </p>
+                    <p style="color: #2d3748; font-size: 16px; line-height: 1.6;">
+                      To maintain your active coach status and continue receiving client connections, please update your insurance documentation before it expires.
+                    </p>
+                    <div style="text-align: center; margin: 30px 0;">
+                      <a href="https://inkwelljournal.io/coach.html" 
+                         style="background: #2A6972; color: white; padding: 14px 28px; text-decoration: none; border-radius: 8px; font-weight: bold;">
+                        Update Insurance Now
+                      </a>
+                    </div>
+                    <p style="color: #718096; font-size: 14px; margin-top: 20px;">
+                      If you have questions, reply to this email and we'll help you through the process.
+                    </p>
+                    <p style="color: #2d3748; font-size: 16px; margin-top: 20px;">
+                      Best,<br>
+                      <strong>The InkWell Team</strong>
+                    </p>
+                  </div>
+                </div>
+              `
+            };
+            
+            await sgMail.send(msg);
+            warningsSent.push(coach.email);
+            
+            // Mark that we sent warning this month
+            await coachDoc.ref.update({
+              [lastWarningKey]: admin.firestore.FieldValue.serverTimestamp()
+            });
+            
+            console.log(`📧 Sent expiration warning to ${coach.email}`);
+          } catch (emailError) {
+            console.error(`❌ Failed to send warning to ${coach.email}:`, emailError);
+            errors.push({ email: coach.email, error: emailError.message });
+          }
+        }
+      }
+    }
+    
+    // Store expiring coaches list for admin portal
+    if (expiringCoaches.length > 0) {
+      await admin.firestore().collection('adminReports').doc('expiringInsurance').set({
+        coaches: expiringCoaches,
+        lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+        totalExpiring: expiringCoaches.length
+      });
+    }
+    
+    const result = {
+      success: true,
+      totalCoachesChecked: coachesSnapshot.size,
+      expiringCount: expiringCoaches.length,
+      warningsSent: warningsSent.length,
+      errors: errors.length > 0 ? errors : undefined
+    };
+    
+    console.log('✅ Insurance check complete:', result);
+    return result;
+    
+  } catch (error) {
+    console.error('❌ Error checking insurance expirations:', error);
+    throw error;
+  }
+});
+
+/**
+ * Manual trigger for insurance expiration check (for admin testing)
+ */
+exports.triggerInsuranceCheck = onCall({
+  secrets: [SENDGRID_API_KEY]
+}, async (request) => {
+  // Verify admin
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Must be authenticated');
+  }
+  
+  const userDoc = await admin.firestore().collection('users').doc(request.auth.uid).get();
+  if (!userDoc.exists || userDoc.data().userRole !== 'admin') {
+    throw new HttpsError('permission-denied', 'Must be admin');
+  }
+  
+  console.log('🔧 Admin triggered manual insurance check');
+  
+  // Run the same logic as scheduled function
+  sgMail.setApiKey(SENDGRID_API_KEY.value());
+  
+  const now = new Date();
+  const sixtyDaysFromNow = new Date(now.getTime() + (60 * 24 * 60 * 60 * 1000));
+  
+  const coachesSnapshot = await admin.firestore()
+    .collection('users')
+    .where('userRole', '==', 'practitioner')
+    .get();
+  
+  const expiringCoaches = [];
+  
+  for (const coachDoc of coachesSnapshot.docs) {
+    const coach = coachDoc.data();
+    
+    const insuranceSnapshot = await admin.firestore()
+      .collection('coachInsuranceRecords')
+      .where('coachId', '==', coachDoc.id)
+      .where('status', '==', 'current')
+      .orderBy('uploadedAt', 'desc')
+      .limit(1)
+      .get();
+    
+    if (!insuranceSnapshot.empty) {
+      const insuranceData = insuranceSnapshot.docs[0].data();
+      const expirationDate = insuranceData.expirationDate ? new Date(insuranceData.expirationDate) : null;
+      
+      if (expirationDate && expirationDate <= sixtyDaysFromNow) {
+        const daysUntilExpiration = Math.ceil((expirationDate - now) / (24 * 60 * 60 * 1000));
+        
+        expiringCoaches.push({
+          coachId: coachDoc.id,
+          email: coach.email,
+          name: coach.displayName || coach.email,
+          expirationDate: expirationDate.toISOString(),
+          daysUntilExpiration
+        });
+      }
+    }
+  }
+  
+  // Update admin report
+  await admin.firestore().collection('adminReports').doc('expiringInsurance').set({
+    coaches: expiringCoaches,
+    lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+    totalExpiring: expiringCoaches.length,
+    triggeredBy: request.auth.uid
+  });
+  
+  return {
+    success: true,
+    expiringCoaches,
+    totalChecked: coachesSnapshot.size
+  };
+});
+
+// ========================================
+// SMS DEDUPLICATION CLEANUP
+// ========================================
+
+/**
+ * Monthly SMS Deduplication Cleanup
+ * Runs on the 1st of every month at 3 AM ET
+ * - Deletes smsDeduplication records older than 30 days
+ * - Keeps the collection from growing indefinitely
+ */
+exports.cleanupSmsDeduplication = onSchedule({
+  schedule: '0 3 1 * *', // 3 AM on 1st of every month
+  timeZone: 'America/New_York'
+}, async (event) => {
+  console.log('🧹 Running monthly SMS deduplication cleanup...');
+  
+  try {
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    
+    // Query for old records
+    const oldRecordsSnapshot = await admin.firestore()
+      .collection('smsDeduplication')
+      .where('sentAt', '<', thirtyDaysAgo)
+      .get();
+    
+    if (oldRecordsSnapshot.empty) {
+      console.log('✅ No old deduplication records to clean up');
+      return { deleted: 0 };
+    }
+    
+    console.log(`🗑️ Found ${oldRecordsSnapshot.size} records older than 30 days`);
+    
+    // Delete in batches of 500 (Firestore limit)
+    const batchSize = 500;
+    let deleted = 0;
+    let batch = admin.firestore().batch();
+    let batchCount = 0;
+    
+    for (const doc of oldRecordsSnapshot.docs) {
+      batch.delete(doc.ref);
+      batchCount++;
+      deleted++;
+      
+      if (batchCount >= batchSize) {
+        await batch.commit();
+        console.log(`🗑️ Deleted batch of ${batchCount} records`);
+        batch = admin.firestore().batch();
+        batchCount = 0;
+      }
+    }
+    
+    // Commit remaining
+    if (batchCount > 0) {
+      await batch.commit();
+      console.log(`🗑️ Deleted final batch of ${batchCount} records`);
+    }
+    
+    console.log(`✅ SMS deduplication cleanup complete. Deleted ${deleted} old records.`);
+    
+    // Log cleanup in admin reports
+    await admin.firestore().collection('adminReports').doc('smsDeduplicationCleanup').set({
+      lastRun: admin.firestore.FieldValue.serverTimestamp(),
+      recordsDeleted: deleted,
+      cutoffDate: thirtyDaysAgo.toISOString()
+    });
+    
+    return { deleted };
+    
+  } catch (error) {
+    console.error('❌ SMS deduplication cleanup error:', error);
+    throw error;
+  }
+});
+
+/**
+ * Admin-callable function to manually trigger SMS deduplication cleanup
+ */
+exports.triggerSmsDeduplicationCleanup = onCall({
+  secrets: []
+}, async (request) => {
+  // Verify admin
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Must be logged in');
+  }
+  
+  const userDoc = await admin.firestore().collection('users').doc(request.auth.uid).get();
+  const userData = userDoc.data();
+  
+  if (!userData || userData.userRole !== 'admin') {
+    throw new HttpsError('permission-denied', 'Must be admin');
+  }
+  
+  console.log('🔧 Admin triggered manual SMS deduplication cleanup');
+  
+  const daysToKeep = request.data?.daysToKeep || 30;
+  const cutoffDate = new Date();
+  cutoffDate.setDate(cutoffDate.getDate() - daysToKeep);
+  
+  // Get all records (for count) then filter old ones
+  const allRecordsSnapshot = await admin.firestore()
+    .collection('smsDeduplication')
+    .get();
+  
+  const oldRecordsSnapshot = await admin.firestore()
+    .collection('smsDeduplication')
+    .where('sentAt', '<', cutoffDate)
+    .get();
+  
+  if (oldRecordsSnapshot.empty) {
+    return {
+      success: true,
+      deleted: 0,
+      totalRecords: allRecordsSnapshot.size,
+      message: `No records older than ${daysToKeep} days found`
+    };
+  }
+  
+  // Delete in batches
+  const batchSize = 500;
+  let deleted = 0;
+  let batch = admin.firestore().batch();
+  let batchCount = 0;
+  
+  for (const doc of oldRecordsSnapshot.docs) {
+    batch.delete(doc.ref);
+    batchCount++;
+    deleted++;
+    
+    if (batchCount >= batchSize) {
+      await batch.commit();
+      batch = admin.firestore().batch();
+      batchCount = 0;
+    }
+  }
+  
+  if (batchCount > 0) {
+    await batch.commit();
+  }
+  
+  // Log cleanup
+  await admin.firestore().collection('adminReports').doc('smsDeduplicationCleanup').set({
+    lastRun: admin.firestore.FieldValue.serverTimestamp(),
+    recordsDeleted: deleted,
+    cutoffDate: cutoffDate.toISOString(),
+    triggeredBy: request.auth.uid
+  });
+  
+  return {
+    success: true,
+    deleted,
+    totalRecordsBefore: allRecordsSnapshot.size,
+    totalRecordsAfter: allRecordsSnapshot.size - deleted,
+    cutoffDate: cutoffDate.toISOString()
+  };
 });
