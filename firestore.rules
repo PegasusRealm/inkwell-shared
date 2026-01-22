@@ -34,37 +34,58 @@ service cloud.firestore {
 
    // User profile docs
     match /users/{userId} {
+      // Allow admins to list/read ALL user docs for admin dashboard
+      allow read: if request.auth != null && isAdmin(request.auth.uid);
+      
+      // Allow individual reads for coaches and self
       allow read: if request.auth != null && (
         request.auth.uid == userId ||  // allow self
         isCoach() ||                   // allow coaches to read user profiles (custom claim)
-        isCoachByRole(request.auth.uid) || // fallback for role-based coaches
-        isAdmin(request.auth.uid)      // allow admins to read user profiles
+        isCoachByRole(request.auth.uid) // fallback for role-based coaches
       );
       // Allow users to write/update all their own data (including phone, smsPreferences, timezone, etc.)
       allow write: if request.auth != null && request.auth.uid == userId;
+      // Allow admins to write/update any user doc (for tier overrides, etc.)
+      allow write: if request.auth != null && isAdmin(request.auth.uid);
     }
 
-    // FIXED: Single practitionerInvitations rule - allows unauthenticated reading for registration
+    // Practitioner invitations - secured via validateInvitation Cloud Function
+    // Direct client reads are blocked to prevent enumeration attacks
     match /practitionerInvitations/{invitationId} {
-      // Allow anyone to read invitation documents (they need the token for registration)
-      allow read: if true;
+      // Reading is done via validateInvitation Cloud Function (server-side)
+      // Allow authenticated users to read their own sent invitations
+      // Allow admins to read ALL invitations for management
+      allow read: if request.auth != null && (
+                    resource.data.fromUserId == request.auth.uid ||
+                    isAdmin(request.auth.uid)
+                  );
       
       // Allow creating invitations if authenticated and user owns the invitation
       allow create: if request.auth != null &&
                     request.resource.data.fromUserId == request.auth.uid;
       
-      // Allow updating invitations for owners or practitioners
+      // Allow updating invitations for owners, practitioners, or admins
       allow update: if request.auth != null && (
         // User can update their own invitations
         resource.data.fromUserId == request.auth.uid ||
-        // Practitioner can update invitations sent to them
-        resource.data.practitionerEmail == request.auth.token.email
+        // Practitioner can update invitations sent to them (after they register)
+        resource.data.practitionerEmail == request.auth.token.email ||
+        // Admins can update any invitation
+        isAdmin(request.auth.uid)
       );
+      
+      // Allow deletion by the invitation owner or admins
+      allow delete: if request.auth != null && (
+                      resource.data.fromUserId == request.auth.uid ||
+                      isAdmin(request.auth.uid)
+                    );
     }
 
     // Manifest docs
     match /manifests/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
+      // Allow admins to read all manifests for metrics/dashboard
+      allow read: if request.auth != null && isAdmin(request.auth.uid);
     }
 
     // Journal entries
@@ -98,7 +119,11 @@ service cloud.firestore {
       allow read: if
         request.auth != null &&
         (
+          // Allow admins to read all entries for metrics/dashboard
+          isAdmin(request.auth.uid) ||
+          // Allow users to read their own entries
           resource.data.userId == request.auth.uid ||
+          // Allow coaches to read entries marked for review
           (
             resource.data.coachReview == true &&
             (isCoach() || isCoachByRole(request.auth.uid))
@@ -212,6 +237,33 @@ service cloud.firestore {
       // Allow practitioners to update their own profiles
       allow update: if request.auth != null && 
                        resource.data.email == request.auth.token.email;
+    }
+
+    // Practitioner tax information
+    match /practitionerTaxInfo/{practitionerId} {
+      // Allow practitioners to read and write their own tax info
+      allow read, write: if request.auth != null && request.auth.uid == practitionerId;
+      
+      // Allow admins to read tax info
+      allow read: if request.auth != null && isAdmin(request.auth.uid);
+    }
+
+    // Practitioner applications
+    match /practitionerApplications/{applicationId} {
+      // Allow users to read and create their own applications
+      allow read, create: if request.auth != null && request.auth.uid == applicationId;
+      
+      // Allow admins to read ALL applications and update any application
+      allow read, update: if request.auth != null && isAdmin(request.auth.uid);
+    }
+
+    // Practitioners collection (for admin dashboard)
+    match /practitioners/{practitionerId} {
+      // Allow practitioners to read/write their own data
+      allow read, write: if request.auth != null && request.auth.uid == practitionerId;
+      
+      // Allow admins to read all practitioners
+      allow read: if request.auth != null && isAdmin(request.auth.uid);
     }
   }
 }

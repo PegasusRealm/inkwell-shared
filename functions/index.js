@@ -2108,6 +2108,87 @@ exports.verifyRecaptcha = onCall({ secrets: [RECAPTCHA_SECRET_KEY] }, async (req
   }
 });
 
+// =============================================================================
+// PRACTITIONER INVITATION VALIDATION
+// =============================================================================
+
+/**
+ * Validate a practitioner invitation token
+ * This replaces direct Firestore reads for security - prevents enumeration attacks
+ * Returns only the data needed for registration, not sensitive details
+ */
+exports.validateInvitation = onRequest(async (req, res) => {
+  // Set CORS headers
+  const origin = req.headers.origin;
+  const allowedOrigins = [
+    'https://inkwell-alpha.web.app',
+    'https://inkwelljournal.io',
+    'https://www.inkwelljournal.io',
+    'http://localhost:5000',
+    'http://127.0.0.1:5000'
+  ];
+  
+  if (allowedOrigins.includes(origin)) {
+    res.set('Access-Control-Allow-Origin', origin);
+  } else {
+    res.set('Access-Control-Allow-Origin', 'https://inkwelljournal.io');
+  }
+  
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type');
+  
+  if (req.method === 'OPTIONS') {
+    return res.status(204).send('');
+  }
+
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const { token } = req.body;
+    
+    if (!token || typeof token !== 'string' || token.length < 20) {
+      return res.status(400).json({ error: 'Invalid invitation token' });
+    }
+
+    // Look up the invitation
+    const inviteDoc = await admin.firestore().collection('practitionerInvitations').doc(token).get();
+    
+    if (!inviteDoc.exists) {
+      // Don't reveal whether token exists or is invalid format
+      return res.status(404).json({ error: 'Invitation not found or expired' });
+    }
+    
+    const inviteData = inviteDoc.data();
+    
+    // Check if invitation is still valid
+    if (inviteData.status !== 'pending') {
+      return res.status(400).json({ error: 'This invitation has already been used or is no longer valid' });
+    }
+    
+    // Check expiration (30 days from creation)
+    if (inviteData.expiresAt && inviteData.expiresAt.toDate() < new Date()) {
+      return res.status(400).json({ error: 'This invitation has expired. Please request a new one.' });
+    }
+
+    // Return only the safe, non-sensitive data needed for registration
+    res.json({
+      success: true,
+      invitation: {
+        fromUserName: inviteData.fromUserName || 'InkWell User',
+        practitionerName: inviteData.practitionerName || '',
+        practitionerEmail: inviteData.practitionerEmail || '',
+        status: inviteData.status
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Error validating invitation:', error);
+    res.status(500).json({ error: 'Failed to validate invitation' });
+  }
+});
+
 // Send practitioner invitation email
 exports.sendPractitionerInvitation = onRequest({ secrets: [SENDGRID_API_KEY] }, async (req, res) => {
   // Set CORS headers for both domains
@@ -3042,7 +3123,7 @@ async function generateInsightsWithOpenAI(journalEntries, manifestEntries, stats
     prompt += `### JOURNAL REFLECTION ANALYSIS:
 **Drawing from Gestalt Therapy, Positive Psychology, and Atomic Habits:**
 
-JOURNAL ENTRIES (${stats.totalJournalEntries} entries, ${stats.totalWords} words):
+JOURNAL ENTRIES (${stats.totalJournalEntries} entries):
 ${journalContent}
 
 **Look for:**
@@ -3077,7 +3158,7 @@ ${manifestContent}
 Acknowledge their ${periodSpecific.timeframe} commitment (${stats.daysActive} active days)
 
 **WEEKLY SNAPSHOT** (Brief data summary in supportive tone)
-- ${stats.totalJournalEntries} journal entries with ${stats.totalWords} words written${hasManifests ? `\n- ${stats.totalManifestEntries} WISH manifestations explored` : ''}
+- ${stats.totalJournalEntries} journal ${stats.totalJournalEntries === 1 ? 'entry' : 'entries'}${hasManifests ? `\n- ${stats.totalManifestEntries} WISH manifestations explored` : ''}
 - Present this as celebration of their consistency and engagement
 
 `;
@@ -5180,7 +5261,19 @@ exports.scheduledDailyPrompts = onSchedule({
       // Check base eligibility
       if (!userData.smsOptIn || !userData.phoneNumber) continue;
       
-      // Get user's timezone (default to Pacific/Honolulu for Hawaii users, or America/New_York)
+      // SUBSCRIPTION CHECK: SMS is a Plus/Connect feature (web only)
+      // During beta testing, also allow 'beta' and 'alpha' special_code users
+      const tier = userData.subscriptionTier || 'free';
+      const specialCode = userData.special_code || '';
+      const isBetaTester = ['alpha', 'beta'].includes(specialCode);
+      const hasSmsAccess = ['plus', 'connect'].includes(tier) || isBetaTester;
+      
+      if (!hasSmsAccess) {
+        // User doesn't have SMS feature access, skip silently
+        continue;
+      }
+      
+      // Get user's timezone (default to America/New_York for US users)
       const userTimezone = userData.timezone || 'America/New_York';
       
       // Get current hour in USER'S timezone
@@ -5190,29 +5283,24 @@ exports.scheduledDailyPrompts = onSchedule({
         hour12: false 
       }));
       
-      // Determine which time window the user is in
-      let currentWindow = '';
-      if (userHour >= 8 && userHour < 10) currentWindow = 'morning';
-      else if (userHour >= 12 && userHour < 14) currentWindow = 'midday';
-      else if (userHour >= 15 && userHour < 17) currentWindow = 'afternoon';
-      else if (userHour >= 19 && userHour < 21) currentWindow = 'evening';
-      else {
-        // User is outside prompt windows in their timezone, skip
+      // FIXED TIME WINDOWS to prevent overlapping:
+      // - GRATITUDE: Lunchtime window (11 AM - 3 PM local time) - widened to ensure scheduler catches all timezones
+      // - JOURNAL: Evening window (6-10 PM local time) - widened for same reason
+      // Note: Scheduler runs every 3 hours, so windows need to be >= 3 hours to guarantee a hit
+      const isGratitudeWindow = userHour >= 11 && userHour < 15;  // 11 AM - 3 PM local
+      const isJournalWindow = userHour >= 18 && userHour < 22;    // 6 PM - 10 PM local
+      
+      // Skip if user is outside both windows in their timezone
+      if (!isGratitudeWindow && !isJournalWindow) {
         continue;
       }
       
-      // Check if user's preferred time slot matches current window
-      const userTimeSlot = userData.promptTimeSlot || 'morning';
-      if (userTimeSlot !== currentWindow) {
-        continue; // Not their preferred time yet
-      }
-      
-      console.log(`📍 User ${userId} in ${userTimezone}: hour ${userHour} = ${currentWindow} window`);
+      console.log(`📍 User ${userId} in ${userTimezone}: hour ${userHour}, gratitudeWindow=${isGratitudeWindow}, journalWindow=${isJournalWindow}`);
       
       // =======================================================================
-      // JOURNAL PROMPTS
+      // JOURNAL PROMPTS - EVENING ONLY (7-9 PM local time)
       // =======================================================================
-      if (userData.smsPreferences?.dailyPrompts) {
+      if (userData.smsPreferences?.dailyPrompts && isJournalWindow) {
         // Check if already sent today
         const lastSent = userData.lastPromptSent?.toDate?.();
         let shouldSendJournal = true;
@@ -5303,15 +5391,13 @@ exports.scheduledDailyPrompts = onSchedule({
                 to: userData.phoneNumber
               });
               
-              // Update user document with last sent time and rotate time slot
-              const nextSlots = { morning: 'midday', midday: 'afternoon', afternoon: 'evening', evening: 'morning' };
+              // Update user document with last sent time (fixed evening window now)
               await admin.firestore().collection('users').doc(userId).update({
-                lastPromptSent: admin.firestore.FieldValue.serverTimestamp(),
-                promptTimeSlot: nextSlots[userTimeSlot] || 'morning'
+                lastPromptSent: admin.firestore.FieldValue.serverTimestamp()
               });
               
               journalSentCount++;
-              console.log(`✅ Sent journal prompt to user ${userId}`);
+              console.log(`✅ Sent journal prompt to user ${userId} (evening window)`);
               
               // Rate limiting: small delay between sends
               await new Promise(resolve => setTimeout(resolve, 100));
@@ -5326,9 +5412,9 @@ exports.scheduledDailyPrompts = onSchedule({
       }
       
       // =======================================================================
-      // GRATITUDE PROMPTS - Separate from journal prompts
+      // GRATITUDE PROMPTS - LUNCHTIME ONLY (12-2 PM local time)
       // =======================================================================
-      if (userData.smsPreferences?.dailyGratitude) {
+      if (userData.smsPreferences?.dailyGratitude && isGratitudeWindow) {
         // Check if already sent gratitude today
         const lastGratitudeSent = userData.lastGratitudeSent?.toDate?.();
         let shouldSendGratitude = true;
@@ -5340,15 +5426,8 @@ exports.scheduledDailyPrompts = onSchedule({
           }
         }
         
-        // Stagger journal and gratitude - don't send both within 6 hours
-        const lastJournalSent = userData.lastPromptSent?.toDate?.();
-        if (lastJournalSent) {
-          const hoursSinceJournal = (now - lastJournalSent) / (1000 * 60 * 60);
-          if (hoursSinceJournal < 6) {
-            shouldSendGratitude = false; // Too soon after journal prompt
-            console.log(`⏳ Skipping gratitude for user ${userId} - journal sent ${hoursSinceJournal.toFixed(1)}h ago`);
-          }
-        }
+        // No need for stagger check - fixed windows ensure 5+ hours separation
+        // Gratitude: 12-2 PM, Journal: 7-9 PM (minimum 5 hours apart)
         
         if (shouldSendGratitude) {
           // Select random gratitude prompt
@@ -5376,7 +5455,7 @@ exports.scheduledDailyPrompts = onSchedule({
             });
             
             gratitudeSentCount++;
-            console.log(`✅ Sent gratitude prompt to user ${userId}`);
+            console.log(`✅ Sent gratitude prompt to user ${userId} (lunchtime window)`);
             
             // Rate limiting: small delay between sends
             await new Promise(resolve => setTimeout(resolve, 100));
@@ -5495,8 +5574,48 @@ exports.scheduledWeeklyInsightsSMS = onSchedule({
           }
         }
         
+        // Get last week's entry count for comparison
+        const lastWeekEnd = new Date(weekStart);
+        lastWeekEnd.setDate(lastWeekEnd.getDate() - 1);
+        lastWeekEnd.setHours(23, 59, 59, 999);
+        const lastWeekStart = new Date(lastWeekEnd);
+        lastWeekStart.setDate(lastWeekStart.getDate() - 6);
+        lastWeekStart.setHours(0, 0, 0, 0);
+        
+        const lastWeekSnapshot = await admin.firestore()
+          .collection('journalEntries')
+          .where('userId', '==', userId)
+          .where('createdAt', '>=', lastWeekStart)
+          .where('createdAt', '<=', lastWeekEnd)
+          .get();
+        const lastWeekCount = lastWeekSnapshot.size;
+        
+        // Calculate current streak (consecutive days with entries)
+        let streak = 0;
+        const today = new Date();
+        for (let i = 0; i < 30; i++) {
+          const checkDate = new Date(today);
+          checkDate.setDate(checkDate.getDate() - i);
+          checkDate.setHours(0, 0, 0, 0);
+          const nextDay = new Date(checkDate);
+          nextDay.setDate(nextDay.getDate() + 1);
+          
+          const dayEntry = await admin.firestore()
+            .collection('journalEntries')
+            .where('userId', '==', userId)
+            .where('createdAt', '>=', checkDate)
+            .where('createdAt', '<', nextDay)
+            .limit(1)
+            .get();
+          
+          if (dayEntry.size > 0) {
+            streak++;
+          } else if (i > 0) {
+            break; // Streak broken
+          }
+        }
+        
         // Build SMS message
-        const avgWords = Math.round(totalWords / entryCount);
         let messageText = `📊 InkWell Weekly Summary\n\n`;
         messageText += `This week you journaled ${entryCount} ${entryCount === 1 ? 'time' : 'times'}`;
         
@@ -5505,8 +5624,30 @@ exports.scheduledWeeklyInsightsSMS = onSchedule({
         }
         
         messageText += `.\n\n`;
-        messageText += `📝 Average: ${avgWords} words per entry\n`;
         
+        // Current streak
+        if (streak > 0) {
+          if (streak >= 7) {
+            messageText += `🔥 ${streak}-day streak! Amazing consistency!\n`;
+          } else if (streak >= 3) {
+            messageText += `🔥 ${streak}-day streak! Keep it going!\n`;
+          } else {
+            messageText += `✨ Current streak: ${streak} ${streak === 1 ? 'day' : 'days'}\n`;
+          }
+        }
+        
+        // Week-over-week comparison
+        if (lastWeekCount > 0) {
+          if (entryCount > lastWeekCount) {
+            messageText += `📈 Up from ${lastWeekCount} entries last week!\n`;
+          } else if (entryCount === lastWeekCount) {
+            messageText += `📊 Consistent with last week - nice rhythm!\n`;
+          }
+        } else if (entryCount >= 3) {
+          messageText += `🌱 Great start to your journaling habit!\n`;
+        }
+        
+        // Most common emotion
         if (topEmotion) {
           const emotionEmojis = {
             'happy': '😊',
@@ -6668,7 +6809,7 @@ exports.checkGracePeriods = onSchedule({
           const subscription = await stripe.subscriptions.retrieve(subscriptionId);
           
           // Update to Plus tier price
-          const plusPriceId = 'price_1SeRgCI0M1vXVDeSRRA8iYRh'; // Plus $14.99/mo
+          const plusPriceId = 'price_XXXXXXXX'; // Plus $6.99/mo - UPDATE WITH NEW STRIPE PRICE ID
           
           await stripe.subscriptions.update(subscriptionId, {
             items: [{
@@ -7477,3 +7618,114 @@ exports.checkStripeConnectStatus = onCall(
     }
   }
 );
+
+// =============================================================================
+// ADMIN: UPGRADE ALL USERS TO PLUS (BETA TESTING)
+// =============================================================================
+
+/**
+ * HTTP endpoint to upgrade all users to Plus tier
+ * This is a one-time migration function for beta testing
+ * 
+ * Usage: curl -X POST https://us-central1-inkwell-alpha.cloudfunctions.net/upgradeAllUsersToPlus?key=ADMIN_SECRET
+ */
+exports.upgradeAllUsersToPlus = onRequest({
+  cors: true,
+  timeoutSeconds: 540, // 9 minutes for large user bases
+}, async (req, res) => {
+  // Simple security check - require a secret key
+  const providedKey = req.query.key || req.body?.key;
+  const expectedKey = 'inkwell-beta-upgrade-2026'; // Simple key for this one-time operation
+  
+  if (providedKey !== expectedKey) {
+    res.status(403).json({ error: 'Invalid key' });
+    return;
+  }
+  
+  console.log('🚀 Starting bulk upgrade to Plus tier...');
+  
+  try {
+    const usersSnapshot = await admin.firestore().collection('users').get();
+    
+    if (usersSnapshot.empty) {
+      res.json({ success: true, message: 'No users found', count: 0 });
+      return;
+    }
+    
+    console.log(`Found ${usersSnapshot.size} users to upgrade`);
+    
+    let successCount = 0;
+    let errorCount = 0;
+    const errors = [];
+    
+    // Process in batches of 500 (Firestore batch limit)
+    const batchSize = 500;
+    let batch = admin.firestore().batch();
+    let batchCount = 0;
+    
+    for (const userDoc of usersSnapshot.docs) {
+      const userRef = admin.firestore().collection('users').doc(userDoc.id);
+      
+      batch.update(userRef, {
+        subscriptionTier: 'plus',
+        subscriptionStatus: 'active',
+        'betaProgress.tierOverride': {
+          tier: 'plus',
+          setAt: admin.firestore.FieldValue.serverTimestamp(),
+          setBy: 'admin-migration-api'
+        }
+      });
+      
+      batchCount++;
+      
+      // Commit batch when it reaches the limit
+      if (batchCount >= batchSize) {
+        try {
+          await batch.commit();
+          successCount += batchCount;
+          console.log(`✅ Committed batch of ${batchCount} users (total: ${successCount})`);
+        } catch (batchError) {
+          errorCount += batchCount;
+          errors.push(`Batch failed: ${batchError.message}`);
+          console.error(`❌ Batch failed:`, batchError);
+        }
+        
+        // Reset batch
+        batch = admin.firestore().batch();
+        batchCount = 0;
+      }
+    }
+    
+    // Commit remaining users
+    if (batchCount > 0) {
+      try {
+        await batch.commit();
+        successCount += batchCount;
+        console.log(`✅ Committed final batch of ${batchCount} users`);
+      } catch (batchError) {
+        errorCount += batchCount;
+        errors.push(`Final batch failed: ${batchError.message}`);
+        console.error(`❌ Final batch failed:`, batchError);
+      }
+    }
+    
+    const result = {
+      success: true,
+      message: 'Bulk upgrade complete',
+      totalUsers: usersSnapshot.size,
+      successCount,
+      errorCount,
+      errors: errors.length > 0 ? errors : undefined
+    };
+    
+    console.log('✅ Migration complete:', result);
+    res.json(result);
+    
+  } catch (error) {
+    console.error('❌ Migration failed:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
