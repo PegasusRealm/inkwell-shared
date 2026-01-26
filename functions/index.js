@@ -131,6 +131,57 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// Helper: Send push notification via FCM
+// Returns true if sent successfully, false otherwise
+async function sendPushNotification(fcmToken, title, body, data = {}) {
+  if (!fcmToken) {
+    console.log('📱 No FCM token provided, skipping push');
+    return false;
+  }
+  
+  try {
+    const message = {
+      token: fcmToken,
+      notification: {
+        title: title,
+        body: body
+      },
+      data: data,
+      apns: {
+        payload: {
+          aps: {
+            // No badge - notification appears but no lingering red dot
+            sound: 'default'
+          }
+        }
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          sound: 'default',
+          priority: 'high',
+          channelId: 'default'
+        }
+      }
+    };
+    
+    const response = await admin.messaging().send(message);
+    console.log(`✅ Push notification sent successfully: ${response}`);
+    return true;
+  } catch (error) {
+    console.error(`❌ Failed to send push notification:`, error.code, error.message);
+    
+    // Handle invalid token - should remove from user document
+    if (error.code === 'messaging/invalid-registration-token' ||
+        error.code === 'messaging/registration-token-not-registered') {
+      console.log('🗑️ Token is invalid, should be removed from user');
+      // Could optionally remove the token here
+    }
+    
+    return false;
+  }
+}
+
 // Helper: Safely update user onboarding state (non-blocking)
 async function updateOnboardingState(userId, updates) {
   try {
@@ -3723,6 +3774,17 @@ async function processWeeklyInsights(requestId) {
         // Send email with insights
         await sendInsightsEmail(userEmail, insights, 'weekly', userName);
         
+        // Send push notification for weekly insights (if user has FCM token)
+        if (userData.fcmToken) {
+          await sendPushNotification(
+            userData.fcmToken,
+            '📊 Your Weekly Insights Are Ready!',
+            `Hi ${userName}, your personalized weekly reflection from Sophy is waiting for you.`,
+            { type: 'weekly_insights' }
+          );
+          console.log(`[${requestId}] 📱 Push notification sent for weekly insights`);
+        }
+        
         processedUsers.push({
           userId,
           email: userEmail,
@@ -3877,6 +3939,17 @@ async function ghostFreeWeeklyInsights(requestId) {
 
         // Send email using existing function
         await sendInsightsEmail(userData.email, insights, 'weekly', userName);
+        
+        // Send push notification for weekly insights (if user has FCM token)
+        if (userData.fcmToken) {
+          await sendPushNotification(
+            userData.fcmToken,
+            '📊 Your Weekly Insights Are Ready!',
+            `Hi ${userName}, your personalized weekly reflection from Sophy is waiting for you.`,
+            { type: 'weekly_insights' }
+          );
+          console.log(`[${requestId}] 📱 Push notification sent for weekly insights`);
+        }
         
         processedUsers.push({
           userId,
@@ -5397,26 +5470,35 @@ exports.scheduledDailyPrompts = onSchedule({
     
     // Get all users who need prompts
     const usersSnapshot = await admin.firestore().collection('users').get();
-    let journalSentCount = 0;
-    let gratitudeSentCount = 0;
+    let journalSmsSentCount = 0;
+    let journalPushSentCount = 0;
+    let gratitudeSmsSentCount = 0;
+    let gratitudePushSentCount = 0;
     let skippedCount = 0;
     
     for (const userDoc of usersSnapshot.docs) {
       const userData = userDoc.data();
       const userId = userDoc.id;
       
-      // Check base eligibility
-      if (!userData.smsOptIn || !userData.phoneNumber) continue;
+      // Determine what channels this user can receive notifications on
+      const hasSmsSetup = userData.smsOptIn && userData.phoneNumber;
+      const hasPushSetup = userData.fcmToken && userData.pushPreferences?.enabled;
+      
+      // Skip if user has neither channel set up
+      if (!hasSmsSetup && !hasPushSetup) continue;
       
       // SUBSCRIPTION CHECK: SMS is a Plus/Connect feature (web only)
-      // During beta testing, also allow 'beta' and 'alpha' special_code users
+      // Push notifications are free for all users
+      // During beta testing, also allow 'beta' and 'alpha' special_code users for SMS
       const tier = userData.subscriptionTier || 'free';
       const specialCode = userData.special_code || '';
       const isBetaTester = ['alpha', 'beta'].includes(specialCode);
-      const hasSmsAccess = ['plus', 'connect'].includes(tier) || isBetaTester;
+      const hasSmsAccess = hasSmsSetup && (['plus', 'connect'].includes(tier) || isBetaTester);
+      // Push is free - just need token and enabled
+      const hasPushAccess = hasPushSetup;
       
-      if (!hasSmsAccess) {
-        // User doesn't have SMS feature access, skip silently
+      // Skip if user has no access to any channel
+      if (!hasSmsAccess && !hasPushAccess) {
         continue;
       }
       
@@ -5442,12 +5524,16 @@ exports.scheduledDailyPrompts = onSchedule({
         continue;
       }
       
-      console.log(`📍 User ${userId} in ${userTimezone}: hour ${userHour}, gratitudeWindow=${isGratitudeWindow}, journalWindow=${isJournalWindow}`);
+      console.log(`📍 User ${userId} in ${userTimezone}: hour ${userHour}, gratitudeWindow=${isGratitudeWindow}, journalWindow=${isJournalWindow}, sms=${hasSmsAccess}, push=${hasPushAccess}`);
       
       // =======================================================================
-      // JOURNAL PROMPTS - EVENING ONLY (7-9 PM local time)
+      // JOURNAL PROMPTS - EVENING ONLY (6-10 PM local time)
       // =======================================================================
-      if (userData.smsPreferences?.dailyPrompts && isJournalWindow) {
+      // Check if user wants journal prompts via SMS or Push
+      const wantsSmsJournal = hasSmsAccess && userData.smsPreferences?.dailyPrompts;
+      const wantsPushJournal = hasPushAccess && userData.pushPreferences?.dailyPrompts;
+      
+      if ((wantsSmsJournal || wantsPushJournal) && isJournalWindow) {
         // Check if already sent today
         const lastSent = userData.lastPromptSent?.toDate?.();
         let shouldSendJournal = true;
@@ -5521,37 +5607,58 @@ exports.scheduledDailyPrompts = onSchedule({
               promptText = GENERIC_PROMPTS[Math.floor(Math.random() * GENERIC_PROMPTS.length)];
             }
             
-            // Send journal prompt SMS
-            try {
-              const twilio = require('twilio');
-              const client = twilio(
-                TWILIO_ACCOUNT_SID.value(),
-                TWILIO_AUTH_TOKEN.value()
-              );
-              
-              const appLink = '\n\nTap to journal: https://inkwelljournal.io/app.html\n\nReply STOP to unsubscribe';
-              const messageText = `✍️ InkWell Daily Prompt:\n\n${promptText}${appLink}`;
-              
-              await client.messages.create({
-                body: messageText,
-                from: TWILIO_PHONE_NUMBER.value(),
-                to: userData.phoneNumber
-              });
-              
-              // Update user document with last sent time (fixed evening window now)
-              await admin.firestore().collection('users').doc(userId).update({
-                lastPromptSent: admin.firestore.FieldValue.serverTimestamp()
-              });
-              
-              journalSentCount++;
-              console.log(`✅ Sent journal prompt to user ${userId} (evening window)`);
-              
-              // Rate limiting: small delay between sends
-              await new Promise(resolve => setTimeout(resolve, 100));
-              
-            } catch (smsError) {
-              console.error(`❌ Failed to send journal SMS to user ${userId}:`, smsError);
+            // Send journal prompt via SMS (if enabled)
+            if (wantsSmsJournal) {
+              try {
+                const twilio = require('twilio');
+                const client = twilio(
+                  TWILIO_ACCOUNT_SID.value(),
+                  TWILIO_AUTH_TOKEN.value()
+                );
+                
+                const appLink = '\n\nTap to journal: https://inkwelljournal.io/app.html\n\nReply STOP to unsubscribe';
+                const messageText = `✍️ InkWell Daily Prompt:\n\n${promptText}${appLink}`;
+                
+                await client.messages.create({
+                  body: messageText,
+                  from: TWILIO_PHONE_NUMBER.value(),
+                  to: userData.phoneNumber
+                });
+                
+                journalSmsSentCount++;
+                console.log(`✅ Sent journal SMS to user ${userId}`);
+                
+              } catch (smsError) {
+                console.error(`❌ Failed to send journal SMS to user ${userId}:`, smsError);
+              }
             }
+            
+            // Send journal prompt via Push Notification (if enabled)
+            if (wantsPushJournal) {
+              try {
+                const pushSent = await sendPushNotification(
+                  userData.fcmToken,
+                  '✍️ Time to Journal',
+                  promptText,
+                  { type: 'journal_prompt', screen: 'Journal' }
+                );
+                
+                if (pushSent) {
+                  journalPushSentCount++;
+                  console.log(`✅ Sent journal push to user ${userId}`);
+                }
+              } catch (pushError) {
+                console.error(`❌ Failed to send journal push to user ${userId}:`, pushError);
+              }
+            }
+            
+            // Update user document with last sent time
+            await admin.firestore().collection('users').doc(userId).update({
+              lastPromptSent: admin.firestore.FieldValue.serverTimestamp()
+            });
+            
+            // Rate limiting: small delay between sends
+            await new Promise(resolve => setTimeout(resolve, 100));
           }
         } else {
           skippedCount++;
@@ -5559,9 +5666,13 @@ exports.scheduledDailyPrompts = onSchedule({
       }
       
       // =======================================================================
-      // GRATITUDE PROMPTS - LUNCHTIME ONLY (12-2 PM local time)
+      // GRATITUDE PROMPTS - LUNCHTIME ONLY (11 AM - 3 PM local time)
       // =======================================================================
-      if (userData.smsPreferences?.dailyGratitude && isGratitudeWindow) {
+      // Check if user wants gratitude prompts via SMS or Push
+      const wantsSmsGratitude = hasSmsAccess && userData.smsPreferences?.dailyGratitude;
+      const wantsPushGratitude = hasPushAccess && userData.pushPreferences?.gratitudePrompts;
+      
+      if ((wantsSmsGratitude || wantsPushGratitude) && isGratitudeWindow) {
         // Check if already sent gratitude today
         const lastGratitudeSent = userData.lastGratitudeSent?.toDate?.();
         let shouldSendGratitude = true;
@@ -5574,48 +5685,74 @@ exports.scheduledDailyPrompts = onSchedule({
         }
         
         // No need for stagger check - fixed windows ensure 5+ hours separation
-        // Gratitude: 12-2 PM, Journal: 7-9 PM (minimum 5 hours apart)
+        // Gratitude: 11 AM - 3 PM, Journal: 6-10 PM (minimum 3 hours apart)
         
         if (shouldSendGratitude) {
           // Select random gratitude prompt
           const gratitudeText = GRATITUDE_PROMPTS[Math.floor(Math.random() * GRATITUDE_PROMPTS.length)];
           
-          // Send gratitude SMS - simple, no links
-          try {
-            const twilio = require('twilio');
-            const client = twilio(
-              TWILIO_ACCOUNT_SID.value(),
-              TWILIO_AUTH_TOKEN.value()
-            );
-            
-            const messageText = `${gratitudeText}\n\nReply STOP to unsubscribe`;
-            
-            await client.messages.create({
-              body: messageText,
-              from: TWILIO_PHONE_NUMBER.value(),
-              to: userData.phoneNumber
-            });
-            
-            // Update user document with last gratitude sent time
-            await admin.firestore().collection('users').doc(userId).update({
-              lastGratitudeSent: admin.firestore.FieldValue.serverTimestamp()
-            });
-            
-            gratitudeSentCount++;
-            console.log(`✅ Sent gratitude prompt to user ${userId} (lunchtime window)`);
-            
-            // Rate limiting: small delay between sends
-            await new Promise(resolve => setTimeout(resolve, 100));
-            
-          } catch (smsError) {
-            console.error(`❌ Failed to send gratitude SMS to user ${userId}:`, smsError);
+          // Send gratitude SMS (if enabled)
+          if (wantsSmsGratitude) {
+            try {
+              const twilio = require('twilio');
+              const client = twilio(
+                TWILIO_ACCOUNT_SID.value(),
+                TWILIO_AUTH_TOKEN.value()
+              );
+              
+              const messageText = `${gratitudeText}\n\nReply STOP to unsubscribe`;
+              
+              await client.messages.create({
+                body: messageText,
+                from: TWILIO_PHONE_NUMBER.value(),
+                to: userData.phoneNumber
+              });
+              
+              gratitudeSmsSentCount++;
+              console.log(`✅ Sent gratitude SMS to user ${userId}`);
+              
+            } catch (smsError) {
+              console.error(`❌ Failed to send gratitude SMS to user ${userId}:`, smsError);
+            }
           }
+          
+          // Send gratitude Push (if enabled)
+          if (wantsPushGratitude) {
+            try {
+              const pushSent = await sendPushNotification(
+                userData.fcmToken,
+                '🙏 Gratitude Moment',
+                gratitudeText,
+                { type: 'gratitude_prompt', screen: 'Journal' }
+              );
+              
+              if (pushSent) {
+                gratitudePushSentCount++;
+                console.log(`✅ Sent gratitude push to user ${userId}`);
+              }
+            } catch (pushError) {
+              console.error(`❌ Failed to send gratitude push to user ${userId}:`, pushError);
+            }
+          }
+          
+          // Update user document with last gratitude sent time
+          await admin.firestore().collection('users').doc(userId).update({
+            lastGratitudeSent: admin.firestore.FieldValue.serverTimestamp()
+          });
+          
+          // Rate limiting: small delay between sends
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
       }
     }
     
-    console.log(`📊 Daily prompts complete: ${journalSentCount} journal, ${gratitudeSentCount} gratitude, ${skippedCount} skipped`);
-    return { success: true, journalSent: journalSentCount, gratitudeSent: gratitudeSentCount, skipped: skippedCount };
+    console.log(`📊 Daily prompts complete: SMS(journal=${journalSmsSentCount}, gratitude=${gratitudeSmsSentCount}), Push(journal=${journalPushSentCount}, gratitude=${gratitudePushSentCount}), skipped=${skippedCount}`);
+    return { 
+      success: true, 
+      sms: { journal: journalSmsSentCount, gratitude: gratitudeSmsSentCount },
+      push: { journal: journalPushSentCount, gratitude: gratitudePushSentCount },
+      skipped: skippedCount 
+    };
     
   } catch (error) {
     console.error('❌ Scheduled daily prompts failed:', error);
@@ -8264,4 +8401,69 @@ exports.triggerSmsDeduplicationCleanup = onCall({
     totalRecordsAfter: allRecordsSnapshot.size - deleted,
     cutoffDate: cutoffDate.toISOString()
   };
+});
+// =============================================================================
+// TEST PUSH NOTIFICATION - For debugging push setup
+// =============================================================================
+
+/**
+ * Send a test push notification to verify FCM is working
+ * Call via: firebase functions:call testPushNotification --data '{"userId":"YOUR_USER_ID"}'
+ * Or from admin console
+ */
+exports.testPushNotification = onCall(async (request) => {
+  const { userId } = request.data;
+  
+  if (!userId) {
+    throw new HttpsError('invalid-argument', 'userId is required');
+  }
+  
+  // Get user document
+  const userDoc = await admin.firestore().collection('users').doc(userId).get();
+  
+  if (!userDoc.exists) {
+    return { success: false, error: 'User not found' };
+  }
+  
+  const userData = userDoc.data();
+  
+  console.log(`🔍 User ${userId} data:`, {
+    fcmToken: userData.fcmToken ? `${userData.fcmToken.substring(0, 20)}...` : 'NOT SET',
+    platform: userData.platform,
+    lastTokenUpdate: userData.lastTokenUpdate,
+    pushPreferences: userData.pushPreferences
+  });
+  
+  if (!userData.fcmToken) {
+    return { 
+      success: false, 
+      error: 'No FCM token found for this user',
+      debug: {
+        hasPushPreferences: !!userData.pushPreferences,
+        pushEnabled: userData.pushPreferences?.enabled
+      }
+    };
+  }
+  
+  // Try to send test notification
+  try {
+    const result = await sendPushNotification(
+      userData.fcmToken,
+      '🔔 Test Notification',
+      'If you see this, push notifications are working!',
+      { type: 'test', timestamp: Date.now().toString() }
+    );
+    
+    return { 
+      success: result, 
+      message: result ? 'Push notification sent successfully!' : 'Failed to send push notification',
+      fcmTokenPrefix: userData.fcmToken.substring(0, 30) + '...'
+    };
+  } catch (error) {
+    return { 
+      success: false, 
+      error: error.message,
+      code: error.code
+    };
+  }
 });
