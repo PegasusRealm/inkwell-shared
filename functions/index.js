@@ -5391,67 +5391,111 @@ const GENERIC_PROMPTS = [
   "What healing happened today, even in small ways?"
 ];
 
-// Gratitude prompts library - simple, clean, focused on appreciation
+// =============================================================================
+// NEURO-TRAINING GRATITUDE + MANIFESTING PROTOCOL
+// Based on research showing gratitude increases dopamine/serotonin, while
+// mental contrasting + implementation intentions create strong cue-behavior links
+// =============================================================================
+
+// THREE GOOD THINGS - Morning gratitude (3 concrete items + why they happened)
+const GRATITUDE_THREE_GOOD_THINGS = [
+  "🌅 Name three good things from yesterday. For each, ask: why did this happen?",
+  "🌅 What are 3 specific moments you're grateful for? What made each one possible?",
+  "🌅 List 3 wins from yesterday, no matter how small. What role did you play in each?",
+  "🌅 What 3 things went well recently? How did your choices contribute to each?",
+  "🌅 Name 3 people who showed up for you lately. What made those connections happen?",
+  "🌅 What 3 challenges turned into opportunities? What allowed that shift?",
+  "🌅 Recall 3 moments of calm or peace. What conditions made them possible?",
+  "🌅 What 3 resources helped you this week? How did they come into your life?"
+];
+
+// TEN-FINGER GRATITUDE - Micro-wins (sleep, pets, safe home, body, etc.)
+const GRATITUDE_MICRO_WINS = [
+  "🙏 Right now: notice your breath, your heartbeat, your body working. What function are you grateful for?",
+  "🙏 Look around your space. What object makes your daily life easier that you rarely acknowledge?",
+  "🙏 Think about last night's sleep. What about your rest deserves appreciation?",
+  "🙏 Consider your home. What about it provides safety or comfort you might overlook?",
+  "🙏 What simple technology (hot water, electricity, phone) made today possible?",
+  "🙏 What part of your body worked well today that you normally take for granted?",
+  "🙏 What meal or drink nourished you recently? Savor that memory for 10 seconds.",
+  "🙏 What access do you have today that you once wished for? (mobility, connection, stability)",
+  "🙏 Consider your pet, a plant, or something living near you. What joy does it bring?",
+  "🙏 What clean resource (water, air, clothes) supported you today?",
+  "🙏 Name one sensory pleasure available right now: a texture, scent, sound, or sight.",
+  "🙏 What small luxury do you have that would have amazed your younger self?",
+  "🙏 What did your hands do for you today?",
+  "🙏 What about your morning routine worked smoothly?",
+  "🙏 What everyday convenience made life easier without you noticing?"
+];
+
+// GOAL PRIMING + MENTAL CONTRASTING - Visualize success, identify obstacles
+const GRATITUDE_GOAL_PRIMING = [
+  "✨ Picture one key goal accomplished. See it vividly. Now name the biggest obstacle standing in your way.",
+  "✨ Imagine your ideal outcome for this week. Feel the success. What habit or emotion might derail you?",
+  "✨ Visualize a project fully complete. Now identify what internal resistance might slow you down.",
+  "✨ See yourself achieving today's priority. Hold that image. What distraction is most likely to appear?",
+  "✨ Picture a relationship thriving. Now ask: what old pattern might I need to release?",
+  "✨ Imagine feeling energized and focused. What circumstance typically drains that energy?",
+  "✨ Envision a health goal met. Now identify the temptation that challenges you most.",
+  "✨ See your day ending with satisfaction. What early warning sign tells you you're veering off track?",
+  "✨ Picture yourself calm under pressure. What trigger usually disrupts that state?",
+  "✨ Visualize completing something you've been avoiding. What feeling comes up when you think about starting?"
+];
+
+// IMPLEMENTATION INTENTIONS - If-then plans linking obstacles to micro-behaviors
+const GRATITUDE_IF_THEN = [
+  "🎯 Complete this: \"If [obstacle appears], then I will [one small action].\"",
+  "🎯 What's your biggest barrier today? Create an if-then rule: \"If I notice [X], I will [Y].\"",
+  "🎯 Name one temptation. Now decide: \"If tempted, I will instead ___.\"",
+  "🎯 When do you typically lose focus? Write: \"If I drift, I will [specific micro-action].\"",
+  "🎯 What emotion derails you? Plan: \"If I feel [emotion], my next move is ___.\"",
+  "🎯 What's your escape behavior? Decide: \"If I reach for [escape], I will first ___.\"",
+  "🎯 When does procrastination hit? Create: \"If I want to delay, I'll commit to just 2 minutes of ___.\"",
+  "🎯 What situation triggers stress? Plan: \"If stress rises, I will immediately ___.\"",
+  "🎯 What excuse do you often use? Counter with: \"If I hear that excuse, I will ___.\"",
+  "🎯 What environment cue pulls you off course? Decide: \"When I see [cue], I will instead ___.\""
+];
+
+// EVENING SAVORING / CONSOLIDATION - Review wins, let good feelings land in body
+const GRATITUDE_EVENING_SAVORING = [
+  "🌙 Name 3 things that went well today. For each, take 20 seconds to let the feeling settle in your body.",
+  "🌙 What choice did you make today that you're proud of? Breathe into that feeling for 30 seconds.",
+  "🌙 Recall a small win. Notice where warmth or relaxation shows up in your body as you remember it.",
+  "🌙 What moment brought you peace today? Close your eyes and relive it for 20 seconds.",
+  "🌙 How did you show up well for yourself or others? Let your nervous system register that goodness.",
+  "🌙 What challenge did you meet today? Take a breath and appreciate your resilience.",
+  "🌙 What connection felt meaningful today? Hold that memory and notice any relaxation in your body.",
+  "🌙 Where did you make progress today? Savor it—let the reward pathway encode this win.",
+  "🌙 What went better than expected? Take 30 seconds to fully absorb that positive surprise.",
+  "🌙 What did you learn about yourself today? Let that insight settle as you breathe slowly."
+];
+
+// BRAIN-BASED EDUCATION - Explaining the neuroscience in accessible terms
+const GRATITUDE_BRAIN_BASED = [
+  "🧠 Gratitude reps increase dopamine and serotonin. Each time you notice good, you're training your brain to see more good.",
+  "🧠 Mental contrasting + if-then plans create automatic behavior links. You're programming your brain like GPS—when X, do Y.",
+  "🧠 Visualization and savoring use neuroplasticity. You're strengthening the same pathways needed for real-world success.",
+  "🧠 When you pause to savor, you activate the parasympathetic nervous system—your brain's rest-and-repair mode.",
+  "🧠 Each gratitude practice literally rewires your brain to notice resources, safety, and support instead of threat.",
+  "🧠 If-then plans recruit the fronto-striatal circuits for self-regulation. You're not relying on willpower—you're automating good decisions.",
+  "🧠 Savoring for 20+ seconds moves experiences from short-term to long-term memory. You're encoding success.",
+  "🧠 Gratitude turns what we have into enough. Each practice shifts your brain from scarcity mode to abundance mode."
+];
+
+// Combined prompts array - weighted for variety
 const GRATITUDE_PROMPTS = [
-  "🙏 What small thing made you smile today?",
-  "🙏 Name one person you're thankful for right now.",
-  "🙏 What's something you're taking for granted that deserves appreciation?",
-  "🙏 What comfort do you have today that you're grateful for?",
-  "🙏 What made today a little bit easier?",
-  "🙏 Who showed you kindness recently?",
-  "🙏 What's one thing your body did for you today?",
-  "🙏 What brought you a moment of peace?",
-  "🙏 What's working well in your life right now?",
-  "🙏 What challenge taught you something valuable?",
-  "🙏 What meal or flavor brought you joy today?",
-  "🙏 What sound or song lifted your spirits?",
-  "🙏 What lesson are you grateful to have learned?",
-  "🙏 What place makes you feel safe?",
-  "🙏 What small pleasure did you enjoy today?",
-  "🙏 Wear gratitude like a cloak and it will feed every corner of your life. - Rumi",
-  "🙏 Gratitude turns what we have into enough. - Aesop",
-  "🙏 The way to develop the habit of savoring is to pause. - Brené Brown",
-  "🙏 Acknowledging the good that you already have is the foundation for all abundance. - Eckhart Tolle",
-  "🙏 This is it. This is your life. It's right in front of you. - Mary Oliver",
-  "🙏 Let gratitude be the pillow upon which you kneel. - Marcus Aurelius",
-  "🙏 When you arise in the morning, think of what a precious privilege it is to be alive. - Marcus Aurelius",
-  "🙏 What simple gift did today offer you?",
-  "🙏 What made you feel connected to others?",
-  "🙏 What ability do you have that makes life easier?",
-  "🙏 What beauty did you notice today?",
-  "🙏 What made you feel cared for?",
-  "🙏 What brought unexpected joy?",
-  "🙏 What are you glad didn't happen today?",
-  "🙏 What strength did you discover in yourself?",
-  "🙏 Trade your expectation for appreciation and the world changes instantly. - Tony Robbins",
-  "🙏 Gratitude is not only the greatest of virtues, but the parent of all others. - Cicero",
-  "🙏 What moment today deserves to be remembered?",
-  "🙏 What problem got solved today?",
-  "🙏 What made you laugh or feel lighter?",
-  "🙏 Who or what helped you today?",
-  "🙏 What's one thing you learned that you're thankful for?",
-  "🙏 What part of your routine brings you comfort?",
-  "🙏 What do you appreciate about where you are right now?",
-  "🙏 The root of joy is gratefulness. - David Steindl-Rast",
-  "🙏 What memory makes you smile when you think of it?",
-  "🙏 What opportunity came your way recently?",
-  "🙏 What simple pleasure are you looking forward to?",
-  "🙏 What choice are you glad you made?",
-  "🙏 What natural wonder brought you peace today?",
-  "🙏 What conversation brightened your day?",
-  "🙏 What resource do you have access to that helps you?",
-  "🙏 What quality in yourself are you grateful for?",
-  "🙏 When we focus on our gratitude, the tide of disappointment goes out. - Kristin Armstrong",
-  "🙏 What act of self-care did you manage today?",
-  "🙏 What progress, however small, did you make?",
-  "🙏 What relationship enriches your life?",
-  "🙏 What made you feel proud of yourself?",
-  "🙏 What gives your life meaning?",
-  "🙏 Enjoy the little things, for one day you may look back and realize they were the big things. - Robert Brault",
-  "🙏 What made today better than you expected?",
-  "🙏 What simple joy can you appreciate right now?",
-  "🙏 What's one thing you have that you once wished for?",
-  "🙏 Sometimes the smallest things take up the most room in your heart. - Winnie the Pooh"
+  // Three Good Things (8 prompts)
+  ...GRATITUDE_THREE_GOOD_THINGS,
+  // Micro-wins - more frequent (15 prompts)
+  ...GRATITUDE_MICRO_WINS,
+  // Goal Priming (10 prompts)
+  ...GRATITUDE_GOAL_PRIMING,
+  // If-Then Planning (10 prompts)
+  ...GRATITUDE_IF_THEN,
+  // Evening Savoring (10 prompts)
+  ...GRATITUDE_EVENING_SAVORING,
+  // Brain-based education (8 prompts, less frequent)
+  ...GRATITUDE_BRAIN_BASED
 ];
 
 /**
