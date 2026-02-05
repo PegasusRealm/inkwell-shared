@@ -88,6 +88,30 @@ service cloud.firestore {
       allow read: if request.auth != null && isAdmin(request.auth.uid);
     }
 
+    // Coach notes for clients (private to the coach)
+    // noteId format: coachId_clientId
+    match /coachNotes/{noteId} {
+      // Coach can read their own notes (check noteId prefix since doc may not exist)
+      allow read: if request.auth != null &&
+                  noteId.matches(request.auth.uid + '_.*');
+      // Coach can write/update their own notes
+      allow write: if request.auth != null &&
+                   noteId.matches(request.auth.uid + '_.*') &&
+                   request.resource.data.coachId == request.auth.uid;
+    }
+
+    // Gift memberships (created by practitioners)
+    match /giftMemberships/{giftId} {
+      // Practitioners can read their own gift codes
+      allow read: if request.auth != null &&
+                  resource.data.createdBy == request.auth.uid;
+      // Admins can read all
+      allow read: if request.auth != null && isAdmin(request.auth.uid);
+      // Creation handled by Cloud Function (createGiftMembership)
+      // Users can read gift code to validate/redeem
+      allow read: if request.auth != null;
+    }
+
     // Journal entries
     match /journalEntries/{entryId} {
       
@@ -123,6 +147,8 @@ service cloud.firestore {
           isAdmin(request.auth.uid) ||
           // Allow users to read their own entries
           resource.data.userId == request.auth.uid ||
+          // Allow coaches to read entries shared with them (coachId matches)
+          resource.data.coachId == request.auth.uid ||
           // Allow coaches to read entries marked for review
           (
             resource.data.coachReview == true &&

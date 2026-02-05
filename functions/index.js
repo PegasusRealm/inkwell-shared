@@ -17,6 +17,8 @@ const TWILIO_PHONE_NUMBER = defineSecret("TWILIO_PHONE_NUMBER");
 const STRIPE_SECRET_KEY = defineSecret("STRIPE_SECRET_KEY");
 const STRIPE_WEBHOOK_SECRET = defineSecret("STRIPE_WEBHOOK_SECRET");
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
+
+// Simple Firebase Admin initialization - let it auto-detect credentials
 if (!getApps().length) {
   admin.initializeApp();
 }
@@ -33,7 +35,6 @@ async function createUserProfileIfNotExists(uid, email) {
       signupUsername: email.split('@')[0],
       userRole: "journaler",
       special_code: "beta", // Tag all new users with beta
-      agreementAccepted: false,
       avatar: "",
       // Subscription fields (default to free tier)
       subscriptionTier: "free",
@@ -85,8 +86,6 @@ const ALLOWED_ORIGINS = [
   'http://localhost:5000',  // Firebase hosting emulator default
   'http://127.0.0.1:5002',
   'http://127.0.0.1:5000',
-  'https://inkwell-alpha.web.app',
-  'https://inkwell-alpha.firebaseapp.com',
   'https://inkwelljournal.io',      // Production domain
   'https://www.inkwelljournal.io'   // Production domain with www
 ];
@@ -96,6 +95,12 @@ function setupHardenedCORS(req, res) {
   
   // Always set Vary: Origin for proper caching behavior
   res.set('Vary', 'Origin');
+  
+  // Allow requests with no origin (mobile apps, server-to-server)
+  // These are authenticated via Bearer token anyway
+  if (!origin) {
+    return true;
+  }
   
   // Check if origin is allowed
   if (!ALLOWED_ORIGINS.includes(origin)) {
@@ -133,13 +138,23 @@ function sleep(ms) {
 
 // Helper: Send push notification via FCM
 // Returns true if sent successfully, false otherwise
-async function sendPushNotification(fcmToken, title, body, data = {}) {
+// Optional options: { badge: number } - set badge count on app icon
+async function sendPushNotification(fcmToken, title, body, data = {}, options = {}) {
   if (!fcmToken) {
     console.log('📱 No FCM token provided, skipping push');
     return false;
   }
   
   try {
+    const apsPayload = {
+      sound: 'default'
+    };
+    
+    // Only add badge if explicitly requested
+    if (options.badge !== undefined) {
+      apsPayload.badge = options.badge;
+    }
+    
     const message = {
       token: fcmToken,
       notification: {
@@ -149,10 +164,7 @@ async function sendPushNotification(fcmToken, title, body, data = {}) {
       data: data,
       apns: {
         payload: {
-          aps: {
-            // No badge - notification appears but no lingering red dot
-            sound: 'default'
-          }
+          aps: apsPayload
         }
       },
       android: {
@@ -515,6 +527,24 @@ When you notice potential cognitive distortions in the user's writing, offer gen
 
 IMPORTANT: Be subtle and warm. Don't lecture or list fallacies. Weave one gentle observation naturally into your reflection if you notice a pattern. Use everyday language, not clinical terms. Always validate their feelings first before offering a different perspective.
 
+SILVER LININGS (Use sparingly and only when genuine):
+When someone shares something difficult, you might gently offer perspective - but only if it feels authentic to the situation. This isn't about toxic positivity or dismissing pain. It's about noticing what might also be true alongside the hard parts.
+
+Approaches that feel supportive (not patronizing):
+- "This sounds really hard. I also notice you [showed resilience/reached out/recognized a pattern/took a step]..."
+- "Even in the middle of this, you [did something, learned something, or showed something about yourself]..."
+- "What you're going through is real. And I wonder if there's also something here about [growth/clarity/what matters to you]..."
+- "It's okay for two things to be true: this is painful, AND [small positive observation]..."
+
+What to AVOID (these feel dismissive):
+- "At least..." or "On the bright side..."
+- "Everything happens for a reason"
+- Rushing to fix or solve
+- Minimizing their experience to find a positive
+- Forcing optimism where there isn't any
+
+The goal: Help them feel heard AND gently notice their own strength, growth, or clarity when it's genuinely there. Sometimes there's no silver lining, and that's okay too - just being present is enough.
+
 Respond naturally and warmly. Use research-backed insights rather than specific statistics. 
 Language should be humble: "Research suggests..." "Many people find..." "This pattern often indicates..." "Sometimes when we're struggling, our mind..."
 
@@ -599,6 +629,183 @@ IMPORTANT: This is a one-time reflection, not a conversation. Do not include phr
   } catch (error) {
     console.error("Enhanced askSophy error:", error.message);
     const userError = mapErrorToUserMessage(error, 'askSophy');
+    res.status(500).json({ 
+      error: userError.message,
+      code: userError.code,
+      retryable: userError.retryable 
+    });
+  }
+});
+
+// Generate Period Insights (7-day or 30-day pattern analysis)
+exports.generatePeriodInsights = onRequest({ 
+  secrets: [ANTHROPIC_API_KEY],
+  invoker: 'public' // Allow unauthenticated HTTP requests (we handle auth via Firebase token)
+}, async (req, res) => {
+  // Set CORS headers for ALL responses (including errors)
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  
+  if (req.method === 'OPTIONS') {
+    return res.status(204).send('');
+  }
+
+  try {
+    const { period } = req.body; // 'weekly' or 'monthly'
+    const requestId = generateRequestId();
+    
+    // Require authentication
+    const authHeader = req.headers.authorization?.replace('Bearer ', '');
+    if (!authHeader) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    
+    const decodedToken = await admin.auth().verifyIdToken(authHeader);
+    const userId = decodedToken.uid;
+    
+    // Check subscription tier (Plus required)
+    const userDoc = await admin.firestore().collection('users').doc(userId).get();
+    const userData = userDoc.data();
+    const tier = userData?.subscriptionTier || 'free';
+    
+    // For testing: Also check if user has alpha role (which grants Plus features)
+    const isAlphaUser = userData?.role === 'alpha' || userData?.roles?.includes('alpha');
+    
+    if (tier === 'free' && !isAlphaUser) {
+      return res.status(200).json({ 
+        error: 'Period insights require InkWell Plus',
+        upgradeRequired: true 
+      });
+    }
+    
+    // Calculate date range
+    const now = new Date();
+    const daysBack = period === 'monthly' ? 30 : 7;
+    const startDate = new Date(now.getTime() - (daysBack * 24 * 60 * 60 * 1000));
+    
+    console.log(`[${requestId}] Fetching entries for user ${userId}, period: ${period}, since: ${startDate.toISOString()}`);
+    
+    // Fetch entries for the user, then filter by date in JavaScript
+    // (avoids needing a composite index for timestamp field)
+    const allEntriesSnap = await admin.firestore()
+      .collection('journalEntries')
+      .where('userId', '==', userId)
+      .orderBy('createdAt', 'desc')
+      .limit(100) // Get recent entries to filter
+      .get();
+    
+    console.log(`[${requestId}] Total entries found: ${allEntriesSnap.size}`);
+    
+    // Filter to entries within the date range
+    const filteredDocs = allEntriesSnap.docs.filter(doc => {
+      const data = doc.data();
+      const entryDate = data.timestamp?.toDate?.() || data.createdAt?.toDate?.() || null;
+      return entryDate && entryDate >= startDate;
+    });
+    
+    console.log(`[${requestId}] Entries within ${daysBack} days: ${filteredDocs.length}`);
+    
+    if (filteredDocs.length < 3) {
+      return res.status(200).json({ 
+        insight: null,
+        insufficientEntries: true,
+        entryCount: filteredDocs.length,
+        message: `You need at least 3 entries in the last ${daysBack} days for Sophy to find meaningful patterns. Keep journaling — you're building something valuable.`
+      });
+    }
+    
+    // Compile entries for analysis
+    const entries = filteredDocs.map(doc => {
+      const data = doc.data();
+      const date = data.timestamp?.toDate?.() || new Date();
+      return {
+        date: date.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+        content: (data.text || data.content || '').substring(0, 500),
+        gratitude: (data.gratitude || '').substring(0, 200),
+        wish: (data.wish || '').substring(0, 200),
+        mood: data.mood || null,
+      };
+    });
+    
+    const entryText = entries.map(e => 
+      `[${e.date}]${e.mood ? ` (Mood: ${e.mood})` : ''}\n${e.content}${e.gratitude ? `\nGratitude: ${e.gratitude}` : ''}${e.wish ? `\nWish: ${e.wish}` : ''}`
+    ).join('\n\n---\n\n');
+    
+    const periodLabel = period === 'monthly' ? '30 days' : '7 days';
+    
+    const systemPrompt = `You are Sophy, an AI journaling companion. You're reviewing ${entries.length} journal entries from the past ${periodLabel} to offer meaningful pattern insights.
+
+You are NOT human and don't pretend to be. You're a thoughtful AI that can notice patterns across entries that might be hard to see day-to-day.
+
+WHAT TO NOTICE:
+- Recurring themes or preoccupations that keep emerging
+- Unfinished business or tensions that appear across entries
+- Shifts in emotional tone over the period
+- Character strengths showing up (courage, kindness, curiosity, perseverance, honesty)
+- Progress on goals, wishes, or intentions
+- Relationship patterns and what matters to this person
+- Self-talk patterns (kind vs. critical toward themselves)
+- Moments of growth, resilience, or clarity
+- Gratitude patterns and what they value
+
+HOW TO REFLECT:
+- Speak naturally, like a thoughtful friend sharing observations
+- No labels, headers, or modality callouts (don't say "Gestalt says..." or "From a positive psychology perspective...")
+- Weave insights together into flowing paragraphs
+- Use "I notice..." and "It seems like..." and "Across these entries..." language
+- Validate the journey, not just achievements
+- Balance noticing challenges with celebrating strengths
+- Offer observations as invitations, not conclusions
+
+TONE:
+- Warm and curious, not clinical or teacherly
+- Honest but kind
+- Brief and focused - no overwhelming them with observations
+- End with something affirming or a gentle reflection
+
+FORMAT:
+- 2-3 flowing paragraphs (no headers, no bullet points, no labeled sections)
+- Aim for 200-300 words
+- Start by referencing something specific from their entries
+- End naturally - no questions, no "let me know if..." - just a closing thought
+
+IMPORTANT: Respond directly - no stage directions, no meta-text, no "Dear..." openings. Just start reflecting.`;
+
+    const data = await callAnthropicWithRetry(
+      {
+        model: "claude-3-haiku-20240307",
+        max_tokens: 600,
+        messages: [
+          { role: "user", content: `${systemPrompt}\n\nJOURNAL ENTRIES FROM THE PAST ${periodLabel.toUpperCase()}:\n\n${entryText}` }
+        ]
+      },
+      "generatePeriodInsights",
+      requestId
+    );
+
+    // Clean the response
+    let cleanedInsight = data.content[0].text.trim()
+      .replace(/^\*[^*]*\*\s*/g, '')
+      .replace(/\*[^*]*\*$/g, '')
+      .replace(/\*[^*]*\*/g, '')
+      .trim();
+
+    console.log(`[${requestId}] generatePeriodInsights success: ${period}, ${entries.length} entries`);
+
+    res.status(200).json({ 
+      insight: cleanedInsight,
+      period: period,
+      entryCount: entries.length,
+      dateRange: {
+        from: startDate.toISOString(),
+        to: now.toISOString()
+      }
+    });
+
+  } catch (error) {
+    console.error("generatePeriodInsights error:", error.message);
+    const userError = mapErrorToUserMessage(error, 'generatePeriodInsights');
     res.status(500).json({ 
       error: userError.message,
       code: userError.code,
@@ -1534,7 +1741,8 @@ exports.logSearchQuery = onRequest(async (req, res) => {
 
 // HTTP function with explicit CORS handling for coach replies
 exports.saveCoachReplyHTTP = onRequest({
-  cors: true
+  cors: true,
+  secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]
 }, async (req, res) => {
   try {
     console.log("🔍 saveCoachReplyHTTP called with method:", req.method);
@@ -1633,7 +1841,7 @@ exports.saveCoachReplyHTTP = onRequest({
 
       console.log("✅ Coach reply saved successfully");
 
-      // Send SMS notification to user if they have it enabled
+      // Send notifications to user (SMS + Push)
       try {
         // Get the journal entry to find the user
         const entryDoc = await admin.firestore().collection("journalEntries").doc(entryId).get();
@@ -1641,17 +1849,59 @@ exports.saveCoachReplyHTTP = onRequest({
           const entryData = entryDoc.data();
           const userId = entryData.userId;
           
-          // Get user's SMS preferences
+          // Get user's preferences
           const userDoc = await admin.firestore().collection("users").doc(userId).get();
           if (userDoc.exists) {
             const userData = userDoc.data();
             
-            // Check if user has SMS enabled and wants practitioner reply notifications
-            if (userData.smsOptIn && userData.phoneNumber && userData.smsPreferences?.coachReplies) {
-              // Get coach's name
-              const coachDoc = await admin.firestore().collection("users").doc(coachUid).get();
-              const coachName = coachDoc.exists ? coachDoc.data().displayName || 'Your coach' : 'Your coach';
-              
+            // Debug log user notification preferences
+            console.log("📱 User notification settings:", {
+              userId,
+              fcmToken: userData.fcmToken ? "present" : "missing",
+              pushEnabled: userData.pushPreferences?.enabled,
+              pushCoachReplies: userData.pushPreferences?.coachReplies,
+              smsOptIn: userData.smsOptIn,
+              phoneNumber: userData.phoneNumber ? "present" : "missing",
+              smsCoachReplies: userData.smsPreferences?.coachReplies
+            });
+            
+            // Get coach's name
+            const coachDoc = await admin.firestore().collection("users").doc(coachUid).get();
+            const coachName = coachDoc.exists ? coachDoc.data().displayName || 'Your coach' : 'Your coach';
+            
+            // Send FCM Push Notification if user has it enabled
+            const shouldSendPush = userData.fcmToken && userData.pushPreferences?.enabled && userData.pushPreferences?.coachReplies !== false;
+            console.log("📲 Push notification decision:", { shouldSendPush, hasFcmToken: !!userData.fcmToken, pushEnabled: userData.pushPreferences?.enabled, coachReplies: userData.pushPreferences?.coachReplies });
+            
+            if (shouldSendPush) {
+              try {
+                const pushSent = await sendPushNotification(
+                  userData.fcmToken,
+                  '💬 New Coach Reply',
+                  `${coachName} replied to your journal entry!`,
+                  {
+                    type: 'coach_reply',
+                    entryId: entryId,
+                    coachName: coachName,
+                  },
+                  { badge: 1 }  // Red dot for coach replies
+                );
+                if (pushSent) {
+                  console.log(`✅ Push notification sent to user ${userId} for coach reply`);
+                }
+              } catch (pushError) {
+                console.error("❌ Failed to send push notification (non-fatal):", pushError.message);
+              }
+            } else {
+              console.log("⏭️ Skipping push notification - conditions not met");
+            }
+            
+            // Send SMS if user has SMS enabled and wants coach reply notifications
+            // Default coachReplies to true if not explicitly set to false
+            const shouldSendSms = userData.smsOptIn && userData.phoneNumber && userData.smsPreferences?.coachReplies !== false;
+            console.log("📱 SMS notification decision:", { shouldSendSms });
+            
+            if (shouldSendSms) {
               // Send SMS
               const twilio = require('twilio');
               const client = twilio(
@@ -1668,12 +1918,18 @@ exports.saveCoachReplyHTTP = onRequest({
               });
               
               console.log(`✅ Practitioner reply SMS sent to user ${userId}`);
+            } else {
+              console.log("⏭️ Skipping SMS - conditions not met");
             }
+          } else {
+            console.log("⚠️ User document not found for notifications:", userId);
           }
+        } else {
+          console.log("⚠️ Journal entry not found for notifications:", entryId);
         }
-      } catch (smsError) {
-        // Don't fail the whole operation if SMS fails
-        console.error("❌ Failed to send practitioner reply SMS (non-fatal):", smsError);
+      } catch (notifyError) {
+        // Don't fail the whole operation if notifications fail
+        console.error("❌ Failed to send notifications (non-fatal):", notifyError);
       }
 
       res.status(200).json({ success: true });
@@ -1898,7 +2154,6 @@ exports.notifyCoachOfTaggedEntry = onRequest({ secrets: [SENDGRID_API_KEY] }, as
       return sendSecureErrorResponse(res, 403, 'Not authorized to notify for this entry');
     }
 
-    const coachEmail = "coach@inkwelljournal.io";
     const timestampNote = `<p style="font-size:0.85em; color:#777;">This message was sent at: ${new Date().toLocaleString()}</p>`;
 
     // Load the journal entry
@@ -1915,6 +2170,36 @@ exports.notifyCoachOfTaggedEntry = onRequest({ secrets: [SENDGRID_API_KEY] }, as
       console.warn(`[${requestId}] Entry ${entryId} belongs to ${entry.userId}, not ${authenticatedUserId}`);
       return sendSecureErrorResponse(res, 403, 'Not authorized to notify for this entry');
     }
+    
+    // Look up the user's connected practitioner
+    const userDoc = await admin.firestore().collection('users').doc(authenticatedUserId).get();
+    const userData = userDoc.data();
+    
+    let coachEmail = null;
+    let coachName = 'Coach';
+    
+    // Check for connectedPractitioner (new format)
+    if (userData?.connectedPractitioner?.email) {
+      coachEmail = userData.connectedPractitioner.email;
+      coachName = userData.connectedPractitioner.name || 'Coach';
+      console.log(`[${requestId}] Found connectedPractitioner: ${coachEmail}`);
+    } 
+    // Fallback: check legacy practitioners array
+    else if (userData?.practitioners && userData.practitioners.length > 0) {
+      const practitionerId = userData.practitioners[0];
+      const practDoc = await admin.firestore().collection('users').doc(practitionerId).get();
+      if (practDoc.exists) {
+        coachEmail = practDoc.data()?.email;
+        coachName = practDoc.data()?.displayName || 'Coach';
+        console.log(`[${requestId}] Found practitioner from array: ${coachEmail}`);
+      }
+    }
+    
+    if (!coachEmail) {
+      console.warn(`[${requestId}] No connected practitioner found for user ${authenticatedUserId}`);
+      return sendSecureErrorResponse(res, 400, 'No coach connected. Please connect to a coach in Settings first.');
+    }
+    
     // Check throttling - don't send duplicate notifications
     const lastNotified = entry?.coachNotifiedAt?.toDate?.();
     if (lastNotified && Date.now() - lastNotified.getTime() < 10 * 60 * 1000) {
@@ -2172,7 +2457,6 @@ exports.validateInvitation = onRequest(async (req, res) => {
   // Set CORS headers
   const origin = req.headers.origin;
   const allowedOrigins = [
-    'https://inkwell-alpha.web.app',
     'https://inkwelljournal.io',
     'https://www.inkwelljournal.io',
     'http://localhost:5000',
@@ -2245,8 +2529,8 @@ exports.sendPractitionerInvitation = onRequest({ secrets: [SENDGRID_API_KEY] }, 
   // Set CORS headers for both domains
   const origin = req.headers.origin;
   const allowedOrigins = [
-    'https://inkwell-alpha.web.app',
     'https://inkwelljournal.io',
+    'https://www.inkwelljournal.io',
     'http://localhost:5000',
     'http://127.0.0.1:5000'
   ];
@@ -6141,6 +6425,9 @@ exports.createCheckoutSession = onCall({
     
     // Check for gift code (can override if higher discount)
     let giftData = null;
+    let giftDiscountWasDowngraded = false;
+    let effectiveGiftDurationMonths = null;
+    
     if (giftCode) {
       const giftDoc = await admin.firestore()
         .collection('giftMemberships')
@@ -6162,15 +6449,32 @@ exports.createCheckoutSession = onCall({
           throw new HttpsError('failed-precondition', 'Gift code has already been used');
         }
         
-        const giftDiscount = giftData.discountPercent * 100; // Convert to percent
+        let giftDiscount = giftData.discountPercent * 100; // Convert to percent
+        
+        // Check if this is a 100% code and user has already used one
+        if (giftDiscount === 100 && userData?.usedFreeMonthCode === true) {
+          console.log(`⚠️ User ${userId} already used a free month code, downgrading 100% to 50%`);
+          giftDiscount = 50;
+          giftDiscountWasDowngraded = true;
+          effectiveGiftDurationMonths = 1; // Downgraded gets 1 month at 50%
+        } else if (giftDiscount === 100) {
+          // 100% codes = 1 month only
+          effectiveGiftDurationMonths = 1;
+        } else {
+          // 50% codes = 3 months
+          effectiveGiftDurationMonths = 3;
+        }
+        
         if (giftDiscount > discountPercent) {
           discountPercent = giftDiscount;
-          discountReason = `Gift from ${giftData.practitionerName || 'practitioner'}`;
+          discountReason = giftDiscountWasDowngraded 
+            ? `Gift from ${giftData.practitionerName || 'practitioner'} (adjusted - free month already used)`
+            : `Gift from ${giftData.practitionerName || 'practitioner'}`;
         }
       }
     }
     
-    console.log('🔷 Final discount:', discountPercent + '%', 'Reason:', discountReason);
+    console.log('🔷 Final discount:', discountPercent + '%', 'Reason:', discountReason, 'Duration:', effectiveGiftDurationMonths, 'months');
 
     // Build session config
     const sessionConfig = {
@@ -6210,18 +6514,34 @@ exports.createCheckoutSession = onCall({
 
     // Apply discount if any (role-based or gift code)
     if (discountPercent > 0) {
-      const coupon = await stripe.coupons.create({
+      const couponConfig = {
         percent_off: discountPercent,
-        duration: giftData ? 'repeating' : 'forever', // Gift codes repeat for 3 months, role discounts are forever
-        duration_in_months: giftData ? 3 : undefined, // 3-month duration for gift codes
         name: discountReason,
-      });
+      };
+      
+      // Gift codes have limited duration, role discounts are forever
+      if (giftData && effectiveGiftDurationMonths) {
+        couponConfig.duration = 'repeating';
+        couponConfig.duration_in_months = effectiveGiftDurationMonths;
+      } else if (giftData) {
+        // Fallback for gift codes without explicit duration
+        couponConfig.duration = 'repeating';
+        couponConfig.duration_in_months = 3;
+      } else {
+        couponConfig.duration = 'forever';
+      }
+      
+      const coupon = await stripe.coupons.create(couponConfig);
       
       sessionConfig.discounts = [{
         coupon: coupon.id,
       }];
       
-      console.log('✅ Applied discount coupon:', coupon.id, discountPercent + '%');
+      // Add metadata about discount type for tracking
+      sessionConfig.metadata.giftDiscountWasDowngraded = giftDiscountWasDowngraded ? 'true' : 'false';
+      sessionConfig.metadata.giftDurationMonths = effectiveGiftDurationMonths || '';
+      
+      console.log('✅ Applied discount coupon:', coupon.id, discountPercent + '%', 'for', effectiveGiftDurationMonths || 'forever', 'months');
     }
 
     const session = await stripe.checkout.sessions.create(sessionConfig);
@@ -6649,7 +6969,7 @@ exports.createGiftMembership = onCall({
       code: giftCode,
       createdBy: userId,
       createdByEmail: practitionerData.email,
-      practitionerName: practitionerData.fullName || practitionerData.displayName,
+      practitionerName: practitionerData.name || practitionerData.email,
       discountPercent: discount,
       maxUses: maxUses || 1,
       recipientEmail: recipientEmail || null,
@@ -7468,9 +7788,8 @@ async function sendGracePeriodEmail(userId, email, type, gracePeriodEnds) {
  * Approve a practitioner application
  * Sets accountType to 'coach' (for 25% discount), creates practitioner revenue tracking
  */
-exports.approvePractitioner = onCall({ secrets: [STRIPE_SECRET_KEY, SENDGRID_API_KEY] }, async (request) => {
+exports.approvePractitioner = onCall({ secrets: [SENDGRID_API_KEY] }, async (request) => {
   try {
-    const stripe = new Stripe(STRIPE_SECRET_KEY.value());
     const { practitionerId } = request.data;
     const callerId = request.auth?.uid;
     
@@ -7478,9 +7797,9 @@ exports.approvePractitioner = onCall({ secrets: [STRIPE_SECRET_KEY, SENDGRID_API
       throw new Error('Not authenticated');
     }
     
-    // Check if caller is admin (you can customize this check)
-    const adminDoc = await admin.firestore().collection('admins').doc(callerId).get();
-    if (!adminDoc.exists) {
+    // Check if caller is admin via userRole in users collection
+    const callerDoc = await admin.firestore().collection('users').doc(callerId).get();
+    if (!callerDoc.exists || callerDoc.data().userRole !== 'admin') {
       throw new Error('Unauthorized - admin access required');
     }
     
@@ -7613,9 +7932,9 @@ exports.rejectPractitioner = onCall({ secrets: [SENDGRID_API_KEY] }, async (requ
       throw new Error('Not authenticated');
     }
     
-    // Check if caller is admin
-    const adminDoc = await admin.firestore().collection('admins').doc(callerId).get();
-    if (!adminDoc.exists) {
+    // Check if caller is admin via userRole in users collection
+    const callerDoc = await admin.firestore().collection('users').doc(callerId).get();
+    if (!callerDoc.exists || callerDoc.data().userRole !== 'admin') {
       throw new Error('Unauthorized - admin access required');
     }
     
@@ -7860,8 +8179,8 @@ exports.createStripeConnectOnboardingLink = onCall(
       // Create account link for onboarding
       const accountLink = await stripe.accountLinks.create({
         account: accountId,
-        refresh_url: 'https://inkwell-alpha.web.app/practitioner-portal.html?refresh=true',
-        return_url: 'https://inkwell-alpha.web.app/practitioner-portal.html?setup=complete',
+        refresh_url: 'https://inkwelljournal.io/practitioner-portal.html?refresh=true',
+        return_url: 'https://inkwelljournal.io/practitioner-portal.html?setup=complete',
         type: 'account_onboarding',
       });
       
@@ -8051,6 +8370,239 @@ exports.upgradeAllUsersToPlus = onRequest({
     
   } catch (error) {
     console.error('❌ Migration failed:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// =============================================================================
+// ADMIN: UPGRADE ALL USERS TO CONNECT (FINAL BETA PHASE)
+// =============================================================================
+
+/**
+ * HTTP endpoint to upgrade all users to Connect tier
+ * This is for the final beta testing phase - unlocks coach access
+ * 
+ * Usage: curl -X POST https://us-central1-inkwell-alpha.cloudfunctions.net/upgradeAllUsersToConnect?key=ADMIN_SECRET
+ */
+exports.upgradeAllUsersToConnect = onRequest({
+  cors: true,
+  timeoutSeconds: 540, // 9 minutes for large user bases
+}, async (req, res) => {
+  // Simple security check - require a secret key
+  const providedKey = req.query.key || req.body?.key;
+  const expectedKey = 'inkwell-beta-connect-2026'; // Key for Connect upgrade
+  
+  if (providedKey !== expectedKey) {
+    res.status(403).json({ error: 'Invalid key' });
+    return;
+  }
+  
+  console.log('🚀 Starting bulk upgrade to Connect tier (final beta phase)...');
+  
+  try {
+    const usersSnapshot = await admin.firestore().collection('users').get();
+    
+    if (usersSnapshot.empty) {
+      res.json({ success: true, message: 'No users found', count: 0 });
+      return;
+    }
+    
+    console.log(`Found ${usersSnapshot.size} users to upgrade to Connect`);
+    
+    let successCount = 0;
+    let errorCount = 0;
+    const errors = [];
+    
+    // Process in batches of 500 (Firestore batch limit)
+    const batchSize = 500;
+    let batch = admin.firestore().batch();
+    let batchCount = 0;
+    
+    for (const userDoc of usersSnapshot.docs) {
+      const userRef = admin.firestore().collection('users').doc(userDoc.id);
+      
+      batch.update(userRef, {
+        subscriptionTier: 'connect',
+        subscriptionStatus: 'active',
+        'betaProgress.tierOverride': {
+          tier: 'connect',
+          setAt: admin.firestore.FieldValue.serverTimestamp(),
+          setBy: 'admin-connect-migration-api'
+        }
+      });
+      
+      batchCount++;
+      
+      // Commit batch when it reaches the limit
+      if (batchCount >= batchSize) {
+        try {
+          await batch.commit();
+          successCount += batchCount;
+          console.log(`✅ Committed batch of ${batchCount} users to Connect (total: ${successCount})`);
+        } catch (batchError) {
+          errorCount += batchCount;
+          errors.push(`Batch failed: ${batchError.message}`);
+          console.error(`❌ Batch failed:`, batchError);
+        }
+        
+        // Reset batch
+        batch = admin.firestore().batch();
+        batchCount = 0;
+      }
+    }
+    
+    // Commit remaining users
+    if (batchCount > 0) {
+      try {
+        await batch.commit();
+        successCount += batchCount;
+        console.log(`✅ Committed final batch of ${batchCount} users to Connect`);
+      } catch (batchError) {
+        errorCount += batchCount;
+        errors.push(`Final batch failed: ${batchError.message}`);
+        console.error(`❌ Final batch failed:`, batchError);
+      }
+    }
+    
+    const result = {
+      success: true,
+      message: 'Bulk upgrade to Connect complete - coach access unlocked!',
+      totalUsers: usersSnapshot.size,
+      successCount,
+      errorCount,
+      errors: errors.length > 0 ? errors : undefined
+    };
+    
+    console.log('✅ Connect migration complete:', result);
+    res.json(result);
+    
+  } catch (error) {
+    console.error('❌ Connect migration failed:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: error.message 
+    });
+  }
+});
+
+// =============================================================================
+// ADMIN: ASSIGN ALL USERS TO COACH HOLLIS VERDANT (BETA TESTING)
+// =============================================================================
+
+/**
+ * HTTP endpoint to assign all users to coach Hollis Verdant
+ * This is for beta testing - gives everyone access to coach features
+ * 
+ * Usage: curl -X POST "https://us-central1-inkwell-alpha.cloudfunctions.net/assignAllUsersToHollis?key=ADMIN_SECRET"
+ */
+exports.assignAllUsersToHollis = onRequest({
+  cors: true,
+  timeoutSeconds: 540, // 9 minutes for large user bases
+}, async (req, res) => {
+  // Simple security check - require a secret key
+  const providedKey = req.query.key || req.body?.key;
+  const expectedKey = 'inkwell-beta-hollis-2026'; // Key for Hollis assignment
+  
+  if (providedKey !== expectedKey) {
+    res.status(403).json({ error: 'Invalid key' });
+    return;
+  }
+  
+  console.log('🎯 Starting bulk assignment to coach Hollis Verdant...');
+  
+  try {
+    const usersSnapshot = await admin.firestore().collection('users').get();
+    
+    if (usersSnapshot.empty) {
+      res.json({ success: true, message: 'No users found', count: 0 });
+      return;
+    }
+    
+    console.log(`Found ${usersSnapshot.size} users to assign to Hollis Verdant`);
+    
+    let successCount = 0;
+    let errorCount = 0;
+    let alreadyConnectedCount = 0;
+    const errors = [];
+    
+    // Process in batches of 500 (Firestore batch limit)
+    const batchSize = 500;
+    let batch = admin.firestore().batch();
+    let batchCount = 0;
+    
+    for (const userDoc of usersSnapshot.docs) {
+      const userData = userDoc.data();
+      
+      // Skip if already connected to a practitioner (optional - remove if you want to overwrite)
+      // if (userData.connectedPractitioner) {
+      //   alreadyConnectedCount++;
+      //   continue;
+      // }
+      
+      const userRef = admin.firestore().collection('users').doc(userDoc.id);
+      
+      batch.update(userRef, {
+        connectedPractitioner: {
+          email: 'coach@inkwelljournal.io',
+          name: 'Hollis Verdant',
+          practitionerId: 'ZiNM7YK1jnRgIkAKiCaO1lC6DGx2',
+          connectedAt: admin.firestore.FieldValue.serverTimestamp(),
+          connectionType: 'beta_assignment'
+        },
+        practitioners: admin.firestore.FieldValue.arrayUnion('ZiNM7YK1jnRgIkAKiCaO1lC6DGx2')
+      });
+      
+      batchCount++;
+      
+      // Commit batch when it reaches the limit
+      if (batchCount >= batchSize) {
+        try {
+          await batch.commit();
+          successCount += batchCount;
+          console.log(`✅ Committed batch of ${batchCount} users to Hollis (total: ${successCount})`);
+        } catch (batchError) {
+          errorCount += batchCount;
+          errors.push(`Batch failed: ${batchError.message}`);
+          console.error(`❌ Batch failed:`, batchError);
+        }
+        
+        // Reset batch
+        batch = admin.firestore().batch();
+        batchCount = 0;
+      }
+    }
+    
+    // Commit remaining users
+    if (batchCount > 0) {
+      try {
+        await batch.commit();
+        successCount += batchCount;
+        console.log(`✅ Committed final batch of ${batchCount} users to Hollis`);
+      } catch (batchError) {
+        errorCount += batchCount;
+        errors.push(`Final batch failed: ${batchError.message}`);
+        console.error(`❌ Final batch failed:`, batchError);
+      }
+    }
+    
+    const result = {
+      success: true,
+      message: 'All users assigned to coach Hollis Verdant!',
+      totalUsers: usersSnapshot.size,
+      successCount,
+      errorCount,
+      alreadyConnectedCount,
+      errors: errors.length > 0 ? errors : undefined
+    };
+    
+    console.log('✅ Hollis assignment complete:', result);
+    res.json(result);
+    
+  } catch (error) {
+    console.error('❌ Hollis assignment failed:', error);
     res.status(500).json({ 
       success: false, 
       error: error.message 
@@ -8509,5 +9061,491 @@ exports.testPushNotification = onCall(async (request) => {
       error: error.message,
       code: error.code
     };
+  }
+});
+
+// =============================================================================
+// WISH MILESTONE NOTIFICATIONS - Scheduled daily check
+// =============================================================================
+/**
+ * Scheduled function to check WISH progress and send milestone notifications
+ * Runs once daily at 10 AM UTC, checks all users' WISH progress
+ * Sends SMS and/or push at 25%, 50%, 75%, 100% completion
+ * Gentle reminders - not daily nags
+ */
+exports.scheduledWishMilestones = onSchedule({
+  schedule: 'every day 10:00',
+  timeZone: 'UTC',
+  secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]
+}, async (event) => {
+  console.log('🎯 Running scheduled WISH milestone check...');
+  
+  const now = new Date();
+  const milestones = [
+    { percent: 25, key: 'quarter', emoji: '🌱' },
+    { percent: 50, key: 'half', emoji: '🍀' },
+    { percent: 75, key: 'three-quarters', emoji: '🌿' },
+    { percent: 100, key: 'complete', emoji: '🌳' }
+  ];
+  
+  // Get all users who might have active WISHes
+  const usersSnapshot = await admin.firestore().collection('users').get();
+  
+  let smsSentCount = 0;
+  let pushSentCount = 0;
+  let skippedCount = 0;
+  let noWishCount = 0;
+  
+  for (const userDoc of usersSnapshot.docs) {
+    const userData = userDoc.data();
+    const userId = userDoc.id;
+    
+    try {
+      // Check notification preferences
+      const hasSmsSetup = userData.smsOptIn && userData.phoneNumber;
+      const hasPushSetup = userData.fcmToken && userData.pushPreferences?.enabled;
+      
+      // Check SMS access (Plus/Connect tier or beta tester)
+      const tier = userData.subscriptionTier || 'free';
+      const specialCode = userData.special_code || '';
+      const isBetaTester = ['alpha', 'beta'].includes(specialCode);
+      const hasSmsAccess = hasSmsSetup && (['plus', 'connect'].includes(tier) || isBetaTester);
+      
+      // Check if user wants WISH milestone notifications
+      const wantsSms = hasSmsAccess && userData.smsPreferences?.wishMilestones !== false;
+      const wantsPush = hasPushSetup && userData.pushPreferences?.wishMilestones !== false;
+      
+      if (!wantsSms && !wantsPush) {
+        skippedCount++;
+        continue;
+      }
+      
+      // Get user's manifest
+      const manifestDoc = await admin.firestore().collection('manifests').doc(userId).get();
+      
+      if (!manifestDoc.exists) {
+        noWishCount++;
+        continue;
+      }
+      
+      const manifest = manifestDoc.data();
+      
+      // Check if WISH is active (has start date and timeline)
+      if (!manifest.startDate || !manifest.timelineDays) {
+        noWishCount++;
+        continue;
+      }
+      
+      // Calculate progress
+      const startDate = new Date(manifest.startDate);
+      const daysElapsed = Math.floor((now.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24));
+      const totalDays = manifest.timelineDays;
+      const progressPercent = Math.min((daysElapsed / totalDays) * 100, 100);
+      
+      // Skip if WISH is in the past (over 100% + buffer) - old completed WISH
+      if (daysElapsed > totalDays + 7) {
+        continue;
+      }
+      
+      // Get milestones already sent for this manifest
+      const milestonesSent = manifest.milestonesSent || [];
+      
+      // Find the current milestone that should be sent
+      let milestoneToSend = null;
+      for (const milestone of milestones) {
+        if (progressPercent >= milestone.percent && !milestonesSent.includes(milestone.key)) {
+          milestoneToSend = milestone;
+          break; // Only send ONE milestone per day max
+        }
+      }
+      
+      if (!milestoneToSend) {
+        continue; // No new milestone to send
+      }
+      
+      console.log(`📊 User ${userId}: ${progressPercent.toFixed(1)}% (${daysElapsed}/${totalDays} days), sending ${milestoneToSend.key} milestone`);
+      
+      // Craft the message
+      let messageTitle = '';
+      let messageBody = '';
+      
+      if (milestoneToSend.key === 'quarter') {
+        messageTitle = '🌱 25% Through Your WISH!';
+        messageBody = `You're 25% through your WISH journey! (${daysElapsed}/${totalDays} days). Keep growing!`;
+      } else if (milestoneToSend.key === 'half') {
+        messageTitle = '🍀 Halfway There!';
+        messageBody = `Amazing! You've completed ${daysElapsed} of ${totalDays} days. Your WISH is blooming!`;
+      } else if (milestoneToSend.key === 'three-quarters') {
+        messageTitle = '🌿 75% Complete!';
+        messageBody = `Only ${totalDays - daysElapsed} days left on your WISH journey. You're doing amazing!`;
+      } else if (milestoneToSend.key === 'complete') {
+        messageTitle = '🌳 WISH Journey Complete!';
+        messageBody = `Congratulations! You've completed your ${totalDays}-day WISH journey! Time to reflect and set a new WISH.`;
+      }
+      
+      // Send Push Notification
+      if (wantsPush) {
+        try {
+          const pushResult = await sendPushNotification(
+            userData.fcmToken,
+            messageTitle,
+            messageBody,
+            { type: 'wish_milestone', milestone: milestoneToSend.key }
+          );
+          if (pushResult) {
+            pushSentCount++;
+            console.log(`✅ Push sent to ${userId} for ${milestoneToSend.key}`);
+          }
+        } catch (pushError) {
+          console.error(`❌ Push failed for ${userId}:`, pushError.message);
+        }
+      }
+      
+      // Send SMS
+      if (wantsSms) {
+        try {
+          const twilio = require('twilio');
+          const client = twilio(
+            TWILIO_ACCOUNT_SID.value(),
+            TWILIO_AUTH_TOKEN.value()
+          );
+          
+          const appLink = '\n\nOpen InkWell: https://inkwelljournal.io/app.html';
+          const smsText = `${milestoneToSend.emoji} InkWell: ${messageBody}${appLink}`;
+          
+          await client.messages.create({
+            body: smsText,
+            from: TWILIO_PHONE_NUMBER.value(),
+            to: userData.phoneNumber
+          });
+          
+          smsSentCount++;
+          console.log(`✅ SMS sent to ${userId} for ${milestoneToSend.key}`);
+        } catch (smsError) {
+          console.error(`❌ SMS failed for ${userId}:`, smsError.message);
+        }
+      }
+      
+      // Mark milestone as sent in manifest document
+      await admin.firestore().collection('manifests').doc(userId).update({
+        milestonesSent: admin.firestore.FieldValue.arrayUnion(milestoneToSend.key),
+        lastMilestoneSentAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+    } catch (userError) {
+      console.error(`❌ Error processing user ${userId}:`, userError.message);
+    }
+  }
+  
+  console.log(`🎯 WISH Milestones complete: ${pushSentCount} push, ${smsSentCount} SMS sent, ${skippedCount} skipped (no prefs), ${noWishCount} no active WISH`);
+});
+
+/**
+ * Set Hollis Verdant as a coach
+ * One-time utility to ensure Hollis has userRole: 'coach'
+ */
+exports.setHollisAsCoach = onRequest({
+  region: 'us-central1',
+  cors: true,
+}, async (req, res) => {
+  try {
+    const { secretKey } = req.body?.data || req.body || {};
+    
+    if (secretKey !== 'inkwell-beta-hollis-2026') {
+      return res.status(403).json({ success: false, error: 'Invalid secret key' });
+    }
+    
+    const hollisUid = 'ZiNM7YK1jnRgIkAKiCaO1lC6DGx2';
+    
+    // Get current Hollis data
+    const hollisDoc = await admin.firestore().collection('users').doc(hollisUid).get();
+    
+    if (!hollisDoc.exists) {
+      return res.status(404).json({ success: false, error: 'Hollis user not found' });
+    }
+    
+    const currentData = hollisDoc.data();
+    
+    // Update to set coach role AND freeAgentOptIn
+    await admin.firestore().collection('users').doc(hollisUid).update({
+      userRole: 'coach',
+      isPractitioner: true,
+      practitionerVerified: true,
+      accountType: 'coach',
+      freeAgentOptIn: true,
+      acceptingClients: 'yes'
+    });
+    
+    res.json({
+      success: true,
+      message: 'Hollis Verdant is now set as a public coach',
+      previousData: {
+        email: currentData.email,
+        displayName: currentData.displayName,
+        userRole: currentData.userRole,
+        isPractitioner: currentData.isPractitioner,
+        practitionerVerified: currentData.practitionerVerified,
+        freeAgentOptIn: currentData.freeAgentOptIn
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error setting Hollis as coach:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * Set any user as a public coach by email
+ * Utility function to set freeAgentOptIn for any coach
+ */
+exports.setCoachPublic = onRequest({
+  region: 'us-central1',
+  cors: true,
+}, async (req, res) => {
+  try {
+    const { secretKey, email } = req.body?.data || req.body || {};
+    
+    if (secretKey !== 'inkwell-beta-admin-2026') {
+      return res.status(403).json({ success: false, error: 'Invalid secret key' });
+    }
+    
+    if (!email) {
+      return res.status(400).json({ success: false, error: 'Email required' });
+    }
+    
+    // Find user by email
+    const usersRef = admin.firestore().collection('users');
+    const snapshot = await usersRef.where('email', '==', email).get();
+    
+    if (snapshot.empty) {
+      return res.status(404).json({ success: false, error: 'User not found with that email' });
+    }
+    
+    const userDoc = snapshot.docs[0];
+    const currentData = userDoc.data();
+    
+    // Update to set coach role AND freeAgentOptIn
+    await userDoc.ref.update({
+      userRole: 'coach',
+      isPractitioner: true,
+      practitionerVerified: true,
+      freeAgentOptIn: true,
+      acceptingClients: 'yes'
+    });
+    
+    res.json({
+      success: true,
+      message: `${currentData.displayName || email} is now a public coach`,
+      uid: userDoc.id,
+      previousData: {
+        email: currentData.email,
+        displayName: currentData.displayName,
+        userRole: currentData.userRole,
+        freeAgentOptIn: currentData.freeAgentOptIn
+      }
+    });
+    
+  } catch (error) {
+    console.error('❌ Error setting coach public:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * Fix admin account and get coach profiles
+ * One-time utility to restore tfershi@pm.me to admin and capture coach data
+ */
+exports.fixAdminGetCoaches = onRequest({
+  region: 'us-central1',
+  cors: true,
+}, async (req, res) => {
+  try {
+    const { secretKey, action } = req.body?.data || req.body || {};
+    
+    if (secretKey !== 'inkwell-beta-admin-2026') {
+      return res.status(403).json({ success: false, error: 'Invalid secret key' });
+    }
+    
+    const db = admin.firestore();
+    const result = {};
+    
+    // Get coach profiles
+    const coach1Doc = await db.collection('users').doc('ZiNM7YK1jnRgIkAKiCaO1lC6DGx2').get();
+    const coach2Doc = await db.collection('users').doc('14QhSBZSxyOmk0bdWvuCNPQnRgZ2').get();
+    
+    result.coaches = {
+      hollisVerdant: coach1Doc.exists ? coach1Doc.data() : null,
+      adamGrimm: coach2Doc.exists ? coach2Doc.data() : null
+    };
+    
+    // Fix admin account if action is 'fix'
+    if (action === 'fix') {
+      await db.collection('users').doc('4FeEdZPE5AOM7jQpii3y4LYnC3I2').update({
+        userRole: 'admin',
+        freeAgentOptIn: admin.firestore.FieldValue.delete(),
+        isPractitioner: admin.firestore.FieldValue.delete(),
+        practitionerVerified: admin.firestore.FieldValue.delete()
+      });
+      result.adminFixed = true;
+      result.message = 'Admin account (tfershi@pm.me) restored to userRole=admin, coach fields removed';
+    } else {
+      result.adminFixed = false;
+      result.message = 'Use action: "fix" to restore admin account';
+    }
+    
+    res.json({ success: true, ...result });
+    
+  } catch (error) {
+    console.error('❌ Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * Migrate user documents - clean up deprecated/duplicate fields
+ * Preserves coach-specific fields for userRole === 'coach'
+ */
+exports.migrateUserFields = onRequest({
+  region: 'us-central1',
+  cors: true,
+  timeoutSeconds: 540, // 9 minutes for large user base
+}, async (req, res) => {
+  try {
+    const { secretKey, dryRun = true, batchSize = 50 } = req.body?.data || req.body || {};
+    
+    if (secretKey !== 'inkwell-beta-admin-2026') {
+      return res.status(403).json({ success: false, error: 'Invalid secret key' });
+    }
+    
+    const db = admin.firestore();
+    const usersRef = db.collection('users');
+    const snapshot = await usersRef.get();
+    
+    // Fields to delete from ALL users (duplicates/deprecated)
+    const fieldsToDeleteAll = [
+      'signupUsername',           // Duplicate of displayName
+      'photoURL',                 // Legacy OAuth; use avatar
+      'lastLoginAt',              // Not actively used
+      'lastTokenUpdate',          // Not actively used
+      'accountType',              // Use userRole
+      'practitioners',            // Legacy array; use connectedPractitioner
+      'connectedCoach',           // Legacy alias
+    ];
+    
+    // Coach-specific fields to delete ONLY from non-coaches
+    const coachOnlyFields = [
+      'isPractitioner',
+      'practitionerVerified',
+      'freeAgentOptIn',
+      'bio',
+      'credentials',
+      'practiceLocation',
+      'specialties',
+      'acceptingClients',
+      'practitionerBio',
+      'practitionerCredentials',
+      'practitionerLocation',
+      'practitionerSpecialties',
+    ];
+    
+    const results = {
+      totalUsers: snapshot.size,
+      processed: 0,
+      updated: 0,
+      skipped: 0,
+      errors: [],
+      dryRun: dryRun,
+      fieldsRemoved: {}
+    };
+    
+    const batch = db.batch();
+    let batchCount = 0;
+    
+    for (const doc of snapshot.docs) {
+      const data = doc.data();
+      const isCoach = data.userRole === 'coach';
+      const isAdmin = data.userRole === 'admin';
+      const updates = {};
+      const deletions = [];
+      
+      // Always delete deprecated fields
+      for (const field of fieldsToDeleteAll) {
+        if (data[field] !== undefined) {
+          updates[field] = admin.firestore.FieldValue.delete();
+          deletions.push(field);
+        }
+      }
+      
+      // Delete nested duplicates in smsPreferences
+      if (data.smsPreferences) {
+        if (data.smsPreferences.phoneNumber !== undefined) {
+          updates['smsPreferences.phoneNumber'] = admin.firestore.FieldValue.delete();
+          deletions.push('smsPreferences.phoneNumber');
+        }
+        if (data.smsPreferences.timezone !== undefined) {
+          updates['smsPreferences.timezone'] = admin.firestore.FieldValue.delete();
+          deletions.push('smsPreferences.timezone');
+        }
+        if (data.smsPreferences.gratitudePrompts !== undefined) {
+          updates['smsPreferences.gratitudePrompts'] = admin.firestore.FieldValue.delete();
+          deletions.push('smsPreferences.gratitudePrompts');
+        }
+      }
+      
+      // Delete betaProgress (deprecated)
+      if (data.betaProgress !== undefined) {
+        updates['betaProgress'] = admin.firestore.FieldValue.delete();
+        deletions.push('betaProgress');
+      }
+      
+      // Delete coach-only fields from non-coaches (but not admins who might test)
+      if (!isCoach && !isAdmin) {
+        for (const field of coachOnlyFields) {
+          if (data[field] !== undefined) {
+            updates[field] = admin.firestore.FieldValue.delete();
+            deletions.push(field);
+          }
+        }
+      }
+      
+      // If there are updates to make
+      if (Object.keys(updates).length > 0) {
+        if (!dryRun) {
+          batch.update(doc.ref, updates);
+          batchCount++;
+          
+          // Commit in batches to avoid memory issues
+          if (batchCount >= batchSize) {
+            await batch.commit();
+            batchCount = 0;
+          }
+        }
+        
+        results.updated++;
+        deletions.forEach(field => {
+          results.fieldsRemoved[field] = (results.fieldsRemoved[field] || 0) + 1;
+        });
+      } else {
+        results.skipped++;
+      }
+      
+      results.processed++;
+    }
+    
+    // Commit any remaining updates
+    if (!dryRun && batchCount > 0) {
+      await batch.commit();
+    }
+    
+    results.message = dryRun 
+      ? `DRY RUN: Would update ${results.updated} users, skip ${results.skipped} users`
+      : `COMPLETED: Updated ${results.updated} users, skipped ${results.skipped} users`;
+    
+    res.json({ success: true, ...results });
+    
+  } catch (error) {
+    console.error('❌ Migration error:', error);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
