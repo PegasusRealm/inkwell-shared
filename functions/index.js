@@ -34,7 +34,8 @@ async function createUserProfileIfNotExists(uid, email) {
       displayName: email.split('@')[0], // Default to email prefix if no username
       signupUsername: email.split('@')[0],
       userRole: "journaler",
-      special_code: "beta", // Tag all new users with beta
+      // Beta period ended Feb 2026 - no auto-tagging
+      // special_code only set manually for loyalty rewards now
       avatar: "",
       // Subscription fields (default to free tier)
       subscriptionTier: "free",
@@ -6371,55 +6372,77 @@ exports.createCheckoutSession = onCall({
       });
     }
 
-    // Determine discount based on role and practitioner selection
-    let discountPercent = 0;
+    // Determine discount based on special_code and practitioner selection
+    let stripeCouponId = null;
     let discountReason = '';
-    let isSpecialPractitioner = false;
+    let isHollisVerdant = false;
     
-    // Check for role-based discounts (alpha, beta, coach)
-    const accountType = userData?.accountType || 'standard';
-    const selectedPractitioner = metadata?.practitionerId || null;
+    // Hollis Verdant coach UID - founder's pen name for beta/alpha testers
+    const HOLLIS_VERDANT_UID = 'ZiNM7YK1jnRgIkAKiCaO1lC6DGx2';
     
-    // Determine tier from priceId
+    // Pre-created Stripe coupon IDs (created in Stripe Dashboard)
+    const STRIPE_COUPONS = {
+      ALPHA_PLUS_80: 'ALPHA_PLUS_80',      // 80% off Plus forever
+      BETA_PLUS_50: 'BETA_PLUS_50',        // 50% off Plus forever
+      ALPHA_CONNECT_20: 'ALPHA_CONNECT_20', // 20% off Connect forever
+      BETA_CONNECT_10: 'BETA_CONNECT_10',   // 10% off Connect forever
+    };
+    
+    // Check for special_code (alpha, beta) - this is the primary discount trigger
+    const specialCode = userData?.special_code || null;
+    const connectedCoach = userData?.connectedCoach || null;
+    const selectedPractitioner = metadata?.practitionerId || connectedCoach;
+    
+    // Check if user has Hollis Verdant as their coach (free Connect = Plus price only)
+    isHollisVerdant = selectedPractitioner === HOLLIS_VERDANT_UID || 
+                      connectedCoach === HOLLIS_VERDANT_UID;
+    
+    // Determine tier from priceId (LIVE MODE)
     let tierName = 'unknown';
-    if (priceId === 'price_1SeRgCI0M1vXVDeSRRA8iYRh') tierName = 'plus';
-    if (priceId === 'price_1SeRgCI0M1vXVDeStsmhHyOz') tierName = 'connect';
+    if (priceId === 'price_1SeQaJIu1E0bDEgZq6V8lATE') tierName = 'plus';
+    if (priceId === 'price_1SyMozIu1E0bDEgZNZ8zoJt2') tierName = 'plus_annual';
+    if (priceId === 'price_1SeQcGIu1E0bDEgZQWWqkrjK') tierName = 'connect';
     
-    console.log('🔷 Account type:', accountType, 'Tier:', tierName);
+    console.log('🔷 Special code:', specialCode, 'Tier:', tierName, 'Hollis:', isHollisVerdant);
     
-    // Role-based discounts
-    if (accountType === 'alpha') {
-      if (tierName === 'plus') {
-        discountPercent = 100; // 100% off Plus
-        discountReason = 'Alpha Tester - Plus Free';
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ALPHA/BETA TESTER DISCOUNT POLICY (February 2026)
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Alpha testers: 80% off Plus forever, 20% off Connect (non-Hollis), Hollis = Plus price
+    // Beta testers: 50% off Plus forever, 10% off Connect (non-Hollis), Hollis = Plus price
+    // Hollis Verdant (founder coach): No coach fee, users pay Plus price for Connect features
+    // ═══════════════════════════════════════════════════════════════════════════
+    
+    if (specialCode === 'alpha') {
+      if (tierName === 'plus' || tierName === 'plus_annual') {
+        stripeCouponId = STRIPE_COUPONS.ALPHA_PLUS_80;
+        discountReason = 'Alpha Tester - 80% Off Plus Forever';
       } else if (tierName === 'connect') {
-        // Check if selecting Hollis Verdant (special 80% off)
-        if (selectedPractitioner === 'hollis-verdant') {
-          discountPercent = 80; // 80% off for Hollis
-          discountReason = 'Alpha Tester - Hollis Verdant (Infrastructure Only)';
-          isSpecialPractitioner = true;
+        if (isHollisVerdant) {
+          // Hollis Verdant = Plus price (no coach fee) - redirect to Plus checkout instead
+          stripeCouponId = STRIPE_COUPONS.ALPHA_PLUS_80;
+          discountReason = 'Alpha Tester - Hollis Verdant (Plus Price)';
         } else {
-          discountPercent = 25; // 25% off for other practitioners
-          discountReason = 'Alpha Tester - Connect Discount';
+          stripeCouponId = STRIPE_COUPONS.ALPHA_CONNECT_20;
+          discountReason = 'Alpha Tester - 20% Off Connect Forever';
         }
       }
-    } else if (accountType === 'beta') {
-      if (tierName === 'plus') {
-        discountPercent = 80; // 80% off Plus
-        discountReason = 'Beta Tester - Plus Discount';
+    } else if (specialCode === 'beta') {
+      if (tierName === 'plus' || tierName === 'plus_annual') {
+        stripeCouponId = STRIPE_COUPONS.BETA_PLUS_50;
+        discountReason = 'Beta Tester - 50% Off Plus Forever';
       } else if (tierName === 'connect') {
-        // Check if selecting Hollis Verdant (special 80% off)
-        if (selectedPractitioner === 'hollis-verdant') {
-          discountPercent = 80; // 80% off for Hollis
-          discountReason = 'Beta Tester - Hollis Verdant (Infrastructure Only)';
-          isSpecialPractitioner = true;
+        if (isHollisVerdant) {
+          // Hollis Verdant = Plus price (no coach fee) - redirect to Plus checkout instead
+          stripeCouponId = STRIPE_COUPONS.BETA_PLUS_50;
+          discountReason = 'Beta Tester - Hollis Verdant (Plus Price)';
         } else {
-          discountPercent = 25; // 25% off for other practitioners
-          discountReason = 'Beta Tester - Connect Discount';
+          stripeCouponId = STRIPE_COUPONS.BETA_CONNECT_10;
+          discountReason = 'Beta Tester - 10% Off Connect Forever';
         }
       }
-    } else if (accountType === 'coach' || userData?.isPractitioner) {
-      discountPercent = 25; // 25% off all tiers for coaches
+    } else if (userData?.accountType === 'coach' || userData?.isPractitioner) {
+      // Mental health professionals get 25% off (created dynamically since no pre-made coupon)
       discountReason = 'Mental Health Professional Discount';
     }
     
@@ -6427,6 +6450,7 @@ exports.createCheckoutSession = onCall({
     let giftData = null;
     let giftDiscountWasDowngraded = false;
     let effectiveGiftDurationMonths = null;
+    let giftDiscountPercent = 0;
     
     if (giftCode) {
       const giftDoc = await admin.firestore()
@@ -6465,16 +6489,13 @@ exports.createCheckoutSession = onCall({
           effectiveGiftDurationMonths = 3;
         }
         
-        if (giftDiscount > discountPercent) {
-          discountPercent = giftDiscount;
-          discountReason = giftDiscountWasDowngraded 
-            ? `Gift from ${giftData.practitionerName || 'practitioner'} (adjusted - free month already used)`
-            : `Gift from ${giftData.practitionerName || 'practitioner'}`;
-        }
+        // Gift codes can override alpha/beta discounts if higher value
+        // Store gift discount info for later comparison
+        giftDiscountPercent = giftDiscount;
       }
     }
     
-    console.log('🔷 Final discount:', discountPercent + '%', 'Reason:', discountReason, 'Duration:', effectiveGiftDurationMonths, 'months');
+    console.log('🔷 Coupon:', stripeCouponId || 'none', 'Reason:', discountReason, 'Gift:', giftDiscountPercent || 0);
 
     // Build session config
     const sessionConfig = {
@@ -6488,9 +6509,9 @@ exports.createCheckoutSession = onCall({
       cancel_url: cancelUrl || `${process.env.APP_URL}/app.html`,
       metadata: {
         firebaseUID: userId,
-        accountType: accountType,
+        specialCode: specialCode || 'none',
         discountReason: discountReason || 'none',
-        isSpecialPractitioner: isSpecialPractitioner,
+        isHollisVerdant: isHollisVerdant,
         ...(selectedPractitioner ? { practitionerId: selectedPractitioner } : {}),
         ...(metadata || {}),
         ...(giftCode ? { giftCode } : {}),
@@ -6502,46 +6523,57 @@ exports.createCheckoutSession = onCall({
       sessionConfig.subscription_data = {
         metadata: {
           firebaseUID: userId,
-          accountType: accountType,
+          specialCode: specialCode || 'none',
           discountReason: discountReason || 'none',
-          isSpecialPractitioner: isSpecialPractitioner,
+          isHollisVerdant: isHollisVerdant,
           ...(selectedPractitioner ? { practitionerId: selectedPractitioner } : {}),
         },
       };
+      
+      // Add 7-day free trial for Plus subscriptions only (not Connect)
+      // Skip trial for alpha/beta testers (they already get extended free periods)
+      if ((tierName === 'plus' || tierName === 'plus_annual') && !specialCode) {
+        sessionConfig.subscription_data.trial_period_days = 7;
+        console.log('🎁 Added 7-day free trial for Plus subscription');
+      }
     }
     
     console.log('🔷 Session config:', JSON.stringify(sessionConfig, null, 2));
 
-    // Apply discount if any (role-based or gift code)
-    if (discountPercent > 0) {
+    // Apply discount: prefer pre-created coupons for alpha/beta, create dynamic for gifts
+    if (stripeCouponId) {
+      // Use pre-created Stripe coupon for alpha/beta testers
+      sessionConfig.discounts = [{
+        coupon: stripeCouponId,
+      }];
+      console.log('✅ Applied pre-created coupon:', stripeCouponId);
+    } else if (giftData && giftDiscountPercent > 0) {
+      // Create dynamic coupon for gift codes (limited duration)
       const couponConfig = {
-        percent_off: discountPercent,
-        name: discountReason,
+        percent_off: giftDiscountPercent,
+        name: giftDiscountWasDowngraded 
+          ? `Gift from ${giftData.practitionerName || 'practitioner'} (adjusted)`
+          : `Gift from ${giftData.practitionerName || 'practitioner'}`,
+        duration: 'repeating',
+        duration_in_months: effectiveGiftDurationMonths || 3,
       };
       
-      // Gift codes have limited duration, role discounts are forever
-      if (giftData && effectiveGiftDurationMonths) {
-        couponConfig.duration = 'repeating';
-        couponConfig.duration_in_months = effectiveGiftDurationMonths;
-      } else if (giftData) {
-        // Fallback for gift codes without explicit duration
-        couponConfig.duration = 'repeating';
-        couponConfig.duration_in_months = 3;
-      } else {
-        couponConfig.duration = 'forever';
-      }
-      
       const coupon = await stripe.coupons.create(couponConfig);
+      sessionConfig.discounts = [{ coupon: coupon.id }];
       
-      sessionConfig.discounts = [{
-        coupon: coupon.id,
-      }];
-      
-      // Add metadata about discount type for tracking
       sessionConfig.metadata.giftDiscountWasDowngraded = giftDiscountWasDowngraded ? 'true' : 'false';
       sessionConfig.metadata.giftDurationMonths = effectiveGiftDurationMonths || '';
       
-      console.log('✅ Applied discount coupon:', coupon.id, discountPercent + '%', 'for', effectiveGiftDurationMonths || 'forever', 'months');
+      console.log('✅ Applied gift coupon:', coupon.id, giftDiscountPercent + '%', 'for', effectiveGiftDurationMonths, 'months');
+    } else if (discountReason === 'Mental Health Professional Discount') {
+      // Create dynamic 25% coupon for coaches
+      const coupon = await stripe.coupons.create({
+        percent_off: 25,
+        name: 'Mental Health Professional Discount',
+        duration: 'forever',
+      });
+      sessionConfig.discounts = [{ coupon: coupon.id }];
+      console.log('✅ Applied coach discount coupon:', coupon.id);
     }
 
     const session = await stripe.checkout.sessions.create(sessionConfig);
@@ -6557,6 +6589,55 @@ exports.createCheckoutSession = onCall({
     console.error('❌ Error creating checkout session:', error);
     console.error('❌ Error stack:', error.stack);
     throw new HttpsError('internal', `Failed to create checkout: ${error.message}`);
+  }
+});
+
+/**
+ * Create a Stripe Billing Portal session for subscription management
+ * Allows users to cancel, update payment method, view invoices
+ */
+exports.createBillingPortalSession = onCall({
+  secrets: [STRIPE_SECRET_KEY],
+  cors: true,
+}, async (request) => {
+  try {
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', 'Must be logged in');
+    }
+    
+    const userId = request.auth.uid;
+    console.log('🔷 Creating billing portal session for user:', userId);
+    
+    // Get user's Stripe customer ID
+    const userDoc = await admin.firestore().collection('users').doc(userId).get();
+    if (!userDoc.exists) {
+      throw new HttpsError('not-found', 'User not found');
+    }
+    
+    const userData = userDoc.data();
+    const customerId = userData.stripeCustomerId;
+    
+    if (!customerId) {
+      throw new HttpsError('failed-precondition', 'No active subscription found. You may have signed up via Apple Pay on mobile.');
+    }
+    
+    const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+    
+    // Create billing portal session
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${request.data.returnUrl || 'https://inkwelljournal.io/app.html'}`,
+    });
+    
+    console.log('✅ Billing portal session created for user:', userId);
+    
+    return {
+      url: session.url,
+    };
+    
+  } catch (error) {
+    console.error('❌ Error creating billing portal session:', error);
+    throw new HttpsError('internal', error.message || 'Failed to open subscription management');
   }
 });
 
@@ -6597,10 +6678,16 @@ exports.handleStripeWebhook = onRequest({
           const subscription = await stripe.subscriptions.retrieve(session.subscription);
           const priceId = subscription.items.data[0].price.id;
           
-          // Determine tier based on price ID
+          // Determine tier based on price ID (LIVE MODE price IDs)
           let tier = 'free';
-          if (priceId.includes('plus')) tier = 'plus';
-          if (priceId.includes('connect')) tier = 'connect';
+          if (priceId === 'price_1SeQaJIu1E0bDEgZq6V8lATE' || priceId === 'price_1SyMozIu1E0bDEgZNZ8zoJt2') {
+            tier = 'plus'; // Plus Monthly or Plus Annual
+          }
+          if (priceId === 'price_1SeQcGIu1E0bDEgZQWWqkrjK') {
+            tier = 'connect'; // Connect tier
+          }
+          
+          console.log(`🎯 Webhook: priceId=${priceId}, determined tier=${tier}`);
           
           // Update user document
           await admin.firestore().collection('users').doc(userId).update({
@@ -6665,16 +6752,32 @@ exports.handleStripeWebhook = onRequest({
         const subscription = event.data.object;
         const userId = subscription.metadata.firebaseUID;
         
-        await admin.firestore().collection('users').doc(userId).update({
-          subscriptionStatus: subscription.status,
-          subscriptionPeriodEnd: new Date(subscription.current_period_end * 1000),
-        });
+        // Check if subscription is set to cancel at period end but still active
+        const periodEnd = new Date(subscription.current_period_end * 1000);
+        const isCanceledButStillActive = subscription.cancel_at_period_end === true && subscription.status === 'active';
         
-        console.log(`✅ Subscription updated for user ${userId}: ${subscription.status}`);
+        const updateData = {
+          subscriptionStatus: isCanceledButStillActive ? 'active_until_period_end' : subscription.status,
+          subscriptionPeriodEnd: periodEnd,
+        };
+        
+        // If canceled at period end, store when access will end (but DON'T downgrade tier yet)
+        if (isCanceledButStillActive) {
+          updateData.subscriptionCancelAtPeriodEnd = true;
+          updateData.subscriptionAccessEndsAt = periodEnd;
+          console.log(`⚠️ Subscription set to cancel at period end for user ${userId}. Access until: ${periodEnd.toISOString()}`);
+        } else {
+          updateData.subscriptionCancelAtPeriodEnd = false;
+        }
+        
+        await admin.firestore().collection('users').doc(userId).update(updateData);
+        
+        console.log(`✅ Subscription updated for user ${userId}: ${subscription.status}, cancel_at_period_end: ${subscription.cancel_at_period_end}`);
         break;
       }
       
       case 'customer.subscription.deleted': {
+        // This fires when the subscription ACTUALLY ends (after period end)
         const subscription = event.data.object;
         const userId = subscription.metadata.firebaseUID;
         
@@ -6682,9 +6785,10 @@ exports.handleStripeWebhook = onRequest({
           subscriptionTier: 'free',
           subscriptionStatus: 'canceled',
           subscriptionCanceledAt: admin.firestore.FieldValue.serverTimestamp(),
+          subscriptionCancelAtPeriodEnd: false,
         });
         
-        console.log(`✅ Subscription canceled for user ${userId}`);
+        console.log(`✅ Subscription ended for user ${userId} - downgraded to free`);
         break;
       }
       
@@ -6718,7 +6822,7 @@ exports.handleStripeWebhook = onRequest({
         
         // Determine if this is Connect tier (has practitioner revenue share)
         const priceId = subscription.items.data[0].price.id;
-        const isConnectTier = priceId === 'price_1SeRgCI0M1vXVDeStsmhHyOz';
+        const isConnectTier = priceId === 'price_1SeQcGIu1E0bDEgZQWWqkrjK';
         
         const amountPaid = invoice.amount_paid / 100; // Convert cents to dollars
         const stripeFee = (invoice.amount_paid * 0.029 + 30) / 100; // 2.9% + $0.30
