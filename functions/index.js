@@ -6357,6 +6357,17 @@ exports.createCheckoutSession = onCall({
     
     let customerId = userData?.stripeCustomerId;
     
+    // Verify existing customer still exists in Stripe, or create new one
+    if (customerId) {
+      try {
+        await stripe.customers.retrieve(customerId);
+        console.log('🔷 Verified existing Stripe customer:', customerId);
+      } catch (err) {
+        console.warn('⚠️ Stored customer ID invalid, creating new customer:', err.message);
+        customerId = null; // Will trigger creation below
+      }
+    }
+    
     if (!customerId) {
       const customer = await stripe.customers.create({
         email: userData.email,
@@ -6365,6 +6376,7 @@ exports.createCheckoutSession = onCall({
         },
       });
       customerId = customer.id;
+      console.log('✅ Created new Stripe customer:', customerId);
       
       // Save customer ID to Firestore
       await admin.firestore().collection('users').doc(userId).update({
@@ -6381,11 +6393,14 @@ exports.createCheckoutSession = onCall({
     const HOLLIS_VERDANT_UID = 'ZiNM7YK1jnRgIkAKiCaO1lC6DGx2';
     
     // Pre-created Stripe coupon IDs (created in Stripe Dashboard)
+    // NOTE: These are the actual Stripe coupon IDs, not the display names
     const STRIPE_COUPONS = {
-      ALPHA_PLUS_80: 'ALPHA_PLUS_80',      // 80% off Plus forever
-      BETA_PLUS_50: 'BETA_PLUS_50',        // 50% off Plus forever
-      ALPHA_CONNECT_20: 'ALPHA_CONNECT_20', // 20% off Connect forever
-      BETA_CONNECT_10: 'BETA_CONNECT_10',   // 10% off Connect forever
+      ALPHA_PLUS_80: 'Aa1ztUkB',                      // 80% off Plus Monthly forever
+      BETA_PLUS_50: 'oMb5nIdt',                       // 50% off Plus Monthly forever
+      ALPHA_PLUS_ANNUAL: 'F6I9Uatr',                  // 80% off Plus Annual forever
+      BETA_PLUS_ANNUAL: 'Z3Cr0JR0',                   // 50% off Plus Annual forever
+      ALPHA_CONNECT_20: 'VYvieLpA',                   // 20% off Connect forever
+      BETA_CONNECT_10: '0vGwlHUs',                    // 10% off Connect forever
     };
     
     // Check for special_code (alpha, beta) - this is the primary discount trigger
@@ -6414,9 +6429,12 @@ exports.createCheckoutSession = onCall({
     // ═══════════════════════════════════════════════════════════════════════════
     
     if (specialCode === 'alpha') {
-      if (tierName === 'plus' || tierName === 'plus_annual') {
+      if (tierName === 'plus') {
         stripeCouponId = STRIPE_COUPONS.ALPHA_PLUS_80;
-        discountReason = 'Alpha Tester - 80% Off Plus Forever';
+        discountReason = 'Alpha Tester - 80% Off Plus Monthly Forever';
+      } else if (tierName === 'plus_annual') {
+        stripeCouponId = STRIPE_COUPONS.ALPHA_PLUS_ANNUAL;
+        discountReason = 'Alpha Tester - 80% Off Plus Annual Forever';
       } else if (tierName === 'connect') {
         if (isHollisVerdant) {
           // Hollis Verdant = Plus price (no coach fee) - redirect to Plus checkout instead
@@ -6428,9 +6446,12 @@ exports.createCheckoutSession = onCall({
         }
       }
     } else if (specialCode === 'beta') {
-      if (tierName === 'plus' || tierName === 'plus_annual') {
+      if (tierName === 'plus') {
         stripeCouponId = STRIPE_COUPONS.BETA_PLUS_50;
-        discountReason = 'Beta Tester - 50% Off Plus Forever';
+        discountReason = 'Beta Tester - 50% Off Plus Monthly Forever';
+      } else if (tierName === 'plus_annual') {
+        stripeCouponId = STRIPE_COUPONS.BETA_PLUS_ANNUAL;
+        discountReason = 'Beta Tester - 50% Off Plus Annual Forever';
       } else if (tierName === 'connect') {
         if (isHollisVerdant) {
           // Hollis Verdant = Plus price (no coach fee) - redirect to Plus checkout instead
@@ -6530,9 +6551,22 @@ exports.createCheckoutSession = onCall({
         },
       };
       
-      // Add 7-day free trial for Plus subscriptions only (not Connect)
-      // Skip trial for alpha/beta testers (they already get extended free periods)
-      if ((tierName === 'plus' || tierName === 'plus_annual') && !specialCode) {
+      // ═══════════════════════════════════════════════════════════════════════════
+      // FREE TRIAL PERIODS (February 2026)
+      // ═══════════════════════════════════════════════════════════════════════════
+      // Alpha testers: 180 days FREE Connect, then lifetime discount applies
+      // Beta testers: 120 days FREE Connect, then lifetime discount applies  
+      // Regular users: 7-day trial on Plus only (not Connect)
+      // ═══════════════════════════════════════════════════════════════════════════
+      
+      if (specialCode === 'alpha') {
+        sessionConfig.subscription_data.trial_period_days = 180;
+        console.log('🎁 Alpha tester: 180 days FREE trial (6 months)');
+      } else if (specialCode === 'beta') {
+        sessionConfig.subscription_data.trial_period_days = 120;
+        console.log('🎁 Beta tester: 120 days FREE trial (4 months)');
+      } else if (tierName === 'plus' || tierName === 'plus_annual') {
+        // Regular users get 7-day trial on Plus only
         sessionConfig.subscription_data.trial_period_days = 7;
         console.log('🎁 Added 7-day free trial for Plus subscription');
       }
