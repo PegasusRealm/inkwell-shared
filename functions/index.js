@@ -463,6 +463,127 @@ exports.generatePrompt = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req,
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GRATITUDE ENGINE (v2 Phase 2b, 2026-07-01)
+// One function, three actions — auth REQUIRED for all:
+//  - personalSubtraction (Plus): mental-subtraction prompt personalized from
+//    the user's own gratitude history (Koo, Algoe, Wilson & Gilbert 2008).
+//  - letterAssist (Plus): Sophy drafts a gratitude letter from rough notes.
+//  - emailLetter (any signed-in user): sends the letter to the USER'S OWN
+//    email only — recipient is never a request parameter.
+// ═══════════════════════════════════════════════════════════════════════════
+exports.gratitudeEngine = onRequest({ secrets: [ANTHROPIC_API_KEY, SENDGRID_API_KEY] }, async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(204).send('');
+
+  const requestId = generateRequestId();
+  try {
+    const authHeader = req.headers.authorization?.replace('Bearer ', '');
+    if (!authHeader) return res.status(401).json({ error: 'Sign in required.' });
+    const decoded = await admin.auth().verifyIdToken(authHeader);
+    const userId = decoded.uid;
+    const { action } = req.body;
+
+    // Shared Plus gate (server-side, authoritative)
+    const requirePlus = async () => {
+      const userDoc = await admin.firestore().collection('users').doc(userId).get();
+      const tier = userDoc.data()?.subscriptionTier || 'free';
+      return ['plus', 'connect'].includes(tier);
+    };
+
+    if (action === 'personalSubtraction') {
+      if (!(await requirePlus())) {
+        return res.status(403).json({ error: 'InkWell Plus unlocks personalized practice.', code: 'UPGRADE_REQUIRED' });
+      }
+      const snap = await admin.firestore().collection('journalEntries')
+        .where('userId', '==', userId)
+        .orderBy('createdAt', 'desc')
+        .limit(60)
+        .get();
+      const gratitudes = [];
+      snap.forEach(d => {
+        const e = d.data();
+        if (e.entryMode === 'gratitude' || (e.tags || []).includes('gratitude')) {
+          if (Array.isArray(e.rawGratitudes)) gratitudes.push(...e.rawGratitudes);
+          else if (e.text) gratitudes.push(String(e.text).slice(0, 300));
+        }
+      });
+      if (gratitudes.length < 3) {
+        return res.status(200).json({
+          prompt: null,
+          code: 'NOT_ENOUGH_HISTORY',
+          message: 'Write a few more gratitude entries first — then Sophy can personalize this practice from your own journal.'
+        });
+      }
+      const material = gratitudes.slice(0, 40).join('\n- ');
+      const sys = `You write ONE mental-subtraction gratitude prompt (based on Koo, Algoe, Wilson & Gilbert, 2008): the user imagines a specific good thing from THEIR OWN life having never happened. Rules: second person; reference ONE concrete thing drawn from their gratitude history below; under 55 words; end with a question asking what would be missing; warm, plain language; no advice, no clinical terms, no preamble — output only the prompt text.`;
+      const data = await callAnthropicWithRetry({
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 160,
+        messages: [{ role: 'user', content: `${sys}\n\nTheir recent gratitudes:\n- ${material}` }]
+      }, 'gratitudeEngine.personalSubtraction', requestId);
+      const prompt = data.content[0].text.trim().replace(/^["']|["']$/g, '');
+      console.log(`[${requestId}] personalSubtraction success`);
+      return res.status(200).json({ prompt });
+    }
+
+    if (action === 'letterAssist') {
+      if (!(await requirePlus())) {
+        return res.status(403).json({ error: 'InkWell Plus unlocks Sophy letter drafting.', code: 'UPGRADE_REQUIRED' });
+      }
+      const notes = String(req.body.notes || '').trim().slice(0, 4000);
+      const recipientName = String(req.body.recipientName || '').trim().slice(0, 80);
+      if (notes.length < 5) {
+        return res.status(400).json({ error: 'Jot a few rough notes first — who they are, what they did, what it meant.' });
+      }
+      const sys = `You help someone draft a gratitude letter${recipientName ? ` to ${recipientName}` : ''} (the gratitude-visit exercise, Seligman et al. 2005). Write 120-180 words in the writer's plain first-person voice using their notes. Be specific and concrete about what the person did, what it cost them, and what it changed. No flowery clichés, no "words cannot express," no advice. Output ONLY the letter body, starting with "Dear ${recipientName || '___'}," and ending with a simple sign-off line without a name.`;
+      const data = await callAnthropicWithRetry({
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 400,
+        messages: [{ role: 'user', content: `${sys}\n\nTheir rough notes:\n${notes}` }]
+      }, 'gratitudeEngine.letterAssist', requestId);
+      const draft = data.content[0].text.trim();
+      console.log(`[${requestId}] letterAssist success`);
+      return res.status(200).json({ draft });
+    }
+
+    if (action === 'emailLetter') {
+      const letterText = String(req.body.letterText || '').trim();
+      if (letterText.length < 10) {
+        return res.status(400).json({ error: 'Write your letter first.' });
+      }
+      const email = decoded.email;
+      if (!email) return res.status(400).json({ error: 'No email address on your account.' });
+      // Light abuse guard: 1 send per minute per user
+      const guardRef = admin.firestore().collection('users').doc(userId);
+      const g = (await guardRef.get()).data() || {};
+      const last = g.lastLetterEmailAt?.toMillis ? g.lastLetterEmailAt.toMillis() : 0;
+      if (Date.now() - last < 60000) {
+        return res.status(429).json({ error: 'One email a minute — try again shortly.' });
+      }
+      const safeName = String(req.body.recipientName || '').trim().slice(0, 80);
+      sgMail.setApiKey(SENDGRID_API_KEY.value());
+      await sgMail.send({
+        to: email, // own email ONLY — never a third party
+        from: 'support@inkwelljournal.io',
+        subject: safeName ? `Your gratitude letter to ${safeName}` : 'Your gratitude letter',
+        text: `${letterText.slice(0, 10000)}\n\n—\nWritten in InkWell. Sending it to them is optional; writing it is where the effect lives.`
+      });
+      await guardRef.set({ lastLetterEmailAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      console.log(`[${requestId}] emailLetter sent to self`);
+      return res.status(200).json({ sent: true });
+    }
+
+    return res.status(400).json({ error: 'Unknown action.' });
+  } catch (error) {
+    console.error(`[${requestId}] gratitudeEngine failed:`, error.message);
+    res.set('Access-Control-Allow-Origin', '*');
+    return res.status(500).json({ error: 'Something hiccuped. Please try again.' });
+  }
+});
+
 // Enhanced askSophy with behavioral pattern recognition
 exports.askSophy = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
