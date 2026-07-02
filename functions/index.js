@@ -4850,9 +4850,15 @@ exports.addToMailchimp = onCall({
     if (!contactId) throw new HttpsError('internal', 'ActiveCampaign returned no contact id');
     console.log(`[${requestId}] ✅ AC contact synced (id ${contactId})`);
 
-    // 2. Subscribe to Master Contact List (resolved by name)
-    const listRes = await fetch(`${AC_URL}/api/3/lists?filters[name]=${encodeURIComponent(LIST_NAME)}`, { headers });
-    const listId = (await listRes.json()).lists?.[0]?.id;
+    // 2. Subscribe to Master Contact List (resolved by name).
+    // Brackets MUST be percent-encoded — literal [ ] gets an empty response
+    // from AC's edge, which killed this step silently (found live 2026-07-02).
+    const listRes = await fetch(`${AC_URL}/api/3/lists?filters%5Bname%5D=${encodeURIComponent(LIST_NAME)}`, { headers });
+    const listText = await listRes.text();
+    if (!listRes.ok || !listText) {
+      console.error(`[${requestId}] ⚠️ AC lists lookup failed ${listRes.status}: ${(listText || '(empty body)').slice(0, 200)}`);
+    }
+    const listId = listText ? (JSON.parse(listText).lists?.[0]?.id) : null;
     if (listId) {
       await fetch(`${AC_URL}/api/3/contactLists`, {
         method: 'POST',
