@@ -9,6 +9,20 @@ const SENDGRID_API_KEY = defineSecret("SENDGRID_API_KEY");
 const RECAPTCHA_SECRET_KEY = defineSecret("RECAPTCHA_SECRET_KEY");
 const ANTHROPIC_API_KEY = defineSecret("ANTHROPIC_API_KEY");
 const OPENAI_API_KEY = defineSecret("OPENAI_API_KEY");
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODEL ROUTING — route by ROLE, never inline model strings (2026-07-01).
+// A model retirement or swap = edit THIS BLOCK ONLY. History: the app ran on
+// claude-3-haiku-20240307 inline in 12 places; Anthropic retired it
+// 2026-04-19 and every AI feature 404'd silently for 10 weeks.
+// NO silent fallback chains by design: PRIME (reflection/crisis) must never
+// auto-route to an unvalidated model (safety gate, decision log 2026-06-13).
+// A retired model now fails LOUD (see MODEL RETIRED log in retry helper).
+const MODELS = {
+  FAST: 'claude-haiku-4-5-20251001',   // utility: prompts, cleanup, subtraction, letters, insights
+  PRIME: 'claude-haiku-4-5-20251001',  // Sophy reflection/crisis — re-pass the suicide-entry test before changing
+};
+// ═══════════════════════════════════════════════════════════════════════════
 const MAILCHIMP_API_KEY = defineSecret("MAILCHIMP_API_KEY");
 const MAILCHIMP_LIST_ID = defineSecret("MAILCHIMP_LIST_ID");
 const TWILIO_ACCOUNT_SID = defineSecret("TWILIO_ACCOUNT_SID");
@@ -335,6 +349,13 @@ async function callAnthropicWithRetry(options, functionName, requestId) {
         return data;
       }
       
+      // Model retired/unknown — fail LOUD and immediately, never retry.
+      // This is the failure mode that hid for 10 weeks (claude-3-haiku retirement).
+      if (response.status === 404) {
+        console.error(`[${requestId}] 🚨 MODEL RETIRED OR UNKNOWN: "${options.model}" returned 404 from Anthropic. Update the MODELS routing block at the top of index.js. ALL features using this role are down.`);
+        throw new Error(`MODEL_RETIRED: ${options.model}`);
+      }
+
       // Handle specific error codes
       if (response.status === 429 || response.status >= 500) {
         const errorText = await response.text();
@@ -422,7 +443,7 @@ exports.generatePrompt = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req,
 
     const data = await callAnthropicWithRetry(
       {
-        model: "claude-3-haiku-20240307",
+        model: MODELS.FAST,
         max_tokens: 200,
         messages: [
           { role: "user", content: `${systemPrompt}\n\n${promptContent}` }
@@ -520,7 +541,7 @@ exports.gratitudeEngine = onRequest({ secrets: [ANTHROPIC_API_KEY, SENDGRID_API_
       const material = gratitudes.slice(0, 40).join('\n- ');
       const sys = `You write ONE mental-subtraction gratitude prompt (based on Koo, Algoe, Wilson & Gilbert, 2008): the user imagines a specific good thing from THEIR OWN life having never happened. Rules: second person; reference ONE concrete thing drawn from their gratitude history below; under 55 words; end with a question asking what would be missing; warm, plain language; no advice, no clinical terms, no preamble — output only the prompt text.`;
       const data = await callAnthropicWithRetry({
-        model: 'claude-3-haiku-20240307',
+        model: MODELS.FAST,
         max_tokens: 160,
         messages: [{ role: 'user', content: `${sys}\n\nTheir recent gratitudes:\n- ${material}` }]
       }, 'gratitudeEngine.personalSubtraction', requestId);
@@ -540,7 +561,7 @@ exports.gratitudeEngine = onRequest({ secrets: [ANTHROPIC_API_KEY, SENDGRID_API_
       }
       const sys = `You help someone draft a gratitude letter${recipientName ? ` to ${recipientName}` : ''} (the gratitude-visit exercise, Seligman et al. 2005). Write 120-180 words in the writer's plain first-person voice using their notes. Be specific and concrete about what the person did, what it cost them, and what it changed. No flowery clichés, no "words cannot express," no advice. Output ONLY the letter body, starting with "Dear ${recipientName || '___'}," and ending with a simple sign-off line without a name.`;
       const data = await callAnthropicWithRetry({
-        model: 'claude-3-haiku-20240307',
+        model: MODELS.FAST,
         max_tokens: 400,
         messages: [{ role: 'user', content: `${sys}\n\nTheir rough notes:\n${notes}` }]
       }, 'gratitudeEngine.letterAssist', requestId);
@@ -678,10 +699,11 @@ Begin your response immediately with your reflection - no introductions or narra
 
 IMPORTANT: This is a one-time reflection, not a conversation. Do not include phrases like "Let me know if you'd like to discuss further", "Would you like me to help with...", "Feel free to share more", or any other conversational follow-ups. Just provide your reflection and end naturally.`;
 
-    // Call Anthropic with enhanced context
+    // Call Anthropic with enhanced context — PRIME role: reflection/crisis path,
+    // safety-gated (suicide-entry test required before any model change)
     const data = await callAnthropicWithRetry(
       {
-        model: "claude-3-haiku-20240307",
+        model: MODELS.PRIME,
         max_tokens: 400,
         messages: [
           { role: "user", content: `${systemPrompt}\n\nUser entry: ${entry}` }
@@ -896,7 +918,7 @@ IMPORTANT: Respond directly - no stage directions, no meta-text, no "Dear..." op
 
     const data = await callAnthropicWithRetry(
       {
-        model: "claude-3-haiku-20240307",
+        model: MODELS.FAST,
         max_tokens: 600,
         messages: [
           { role: "user", content: `${systemPrompt}\n\nJOURNAL ENTRIES FROM THE PAST ${periodLabel.toUpperCase()}:\n\n${entryText}` }
@@ -1190,7 +1212,7 @@ exports.refineManifest = onCall({ secrets: [ANTHROPIC_API_KEY] }, async (data, c
 
     const result = await callAnthropicWithRetry(
       {
-        model: "claude-3-haiku-20240307",
+        model: MODELS.FAST,
         max_tokens: 300,
         messages: [
           { role: "user", content: `You are a journaling assistant that helps users articulate their vision and purpose in a supportive, emotionally aware tone.\n\n${prompt}` }
@@ -1252,7 +1274,7 @@ exports.cleanVoiceTranscript = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async
 
     const data = await callAnthropicWithRetry(
       {
-        model: "claude-3-haiku-20240307",
+        model: MODELS.FAST,
         max_tokens: 300,
         messages: [
           {
@@ -1400,7 +1422,7 @@ async function cleanTranscriptWithAI(transcript) {
   
   const data = await callAnthropicWithRetry(
     {
-      model: "claude-3-haiku-20240307",
+      model: MODELS.FAST,
       max_tokens: 300,
       messages: [
         {
@@ -1476,7 +1498,7 @@ Respond in JSON format only:
   try {
     const data = await callAnthropicWithRetry(
       {
-        model: 'claude-3-haiku-20240307',
+        model: MODELS.FAST,
         max_tokens: 300,
         messages: [{ role: 'user', content: prompt }]
       },
@@ -1528,7 +1550,7 @@ Respond as Sophy would - warm, encouraging, and focused on the person's wellbein
   try {
     const data = await callAnthropicWithRetry(
       {
-        model: 'claude-3-haiku-20240307',
+        model: MODELS.FAST,
         max_tokens: 80,
         messages: [{ role: 'user', content: prompt }]
       },
@@ -1737,7 +1759,7 @@ If no entries are meaningfully relevant, return an empty array: []`;
 
     const result = await callAnthropicWithRetry(
       {
-        model: "claude-3-haiku-20240307",
+        model: MODELS.FAST,
         max_tokens: 500,
         messages: [
           { role: "user", content: analysisPrompt }
@@ -6035,7 +6057,7 @@ exports.scheduledDailyPrompts = onSchedule({
                   if (recentText.trim()) {
                     // Generate personalized prompt
                     const aiResponse = await callAnthropicWithRetry({
-                      model: "claude-3-haiku-20240307",
+                      model: MODELS.FAST,
                       max_tokens: 150,
                       messages: [{
                         role: "user",
