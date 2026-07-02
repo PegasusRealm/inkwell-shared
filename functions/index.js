@@ -3662,6 +3662,14 @@ async function generateInsightsWithOpenAI(journalEntries, manifestEntries, stats
 
 `;
 
+  // Then-vs-now (v2 Phase 4, 2026-07-02): make the journal's compounding visible
+  if (period === 'monthly') {
+    prompt += `### THEN-VS-NOW (include ONLY if the entries genuinely support it):
+In one or two sentences, draw one explicit comparison between this month and an earlier point in their writing ("Earlier you framed X as...; this month it reads more like..."). Ground it in their actual words. If the history is too thin to support a real comparison, skip this entirely rather than forcing one.
+
+`;
+  }
+
   // Add journal analysis section if they have journal entries
   if (hasJournals) {
     prompt += `### JOURNAL REFLECTION ANALYSIS:
