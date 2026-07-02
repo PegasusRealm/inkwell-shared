@@ -6415,7 +6415,8 @@ exports.createCheckoutSession = onCall({
     // Determine tier from priceId (LIVE MODE)
     let tierName = 'unknown';
     if (priceId === 'price_1SeQaJIu1E0bDEgZq6V8lATE') tierName = 'plus';
-    if (priceId === 'price_1SyMozIu1E0bDEgZNZ8zoJt2') tierName = 'plus_annual';
+    if (priceId === 'price_1SyMozIu1E0bDEgZNZ8zoJt2') tierName = 'plus_annual'; // legacy $69.99/yr
+    if (priceId === 'price_1ToXwuIu1E0bDEgZRe1elpOv') tierName = 'plus_annual'; // $49.99/yr (2026-07-01)
     if (priceId === 'price_1SeQcGIu1E0bDEgZQWWqkrjK') tierName = 'connect';
     
     console.log('🔷 Special code:', specialCode, 'Tier:', tierName, 'Hollis:', isHollisVerdant);
@@ -6714,8 +6715,8 @@ exports.handleStripeWebhook = onRequest({
           
           // Determine tier based on price ID (LIVE MODE price IDs)
           let tier = 'free';
-          if (priceId === 'price_1SeQaJIu1E0bDEgZq6V8lATE' || priceId === 'price_1SyMozIu1E0bDEgZNZ8zoJt2') {
-            tier = 'plus'; // Plus Monthly or Plus Annual
+          if (priceId === 'price_1SeQaJIu1E0bDEgZq6V8lATE' || priceId === 'price_1SyMozIu1E0bDEgZNZ8zoJt2' || priceId === 'price_1ToXwuIu1E0bDEgZRe1elpOv') {
+            tier = 'plus'; // Plus Monthly or Plus Annual (incl. $49.99/yr, 2026-07-01)
           }
           if (priceId === 'price_1SeQcGIu1E0bDEgZQWWqkrjK') {
             tier = 'connect'; // Connect tier
