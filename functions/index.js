@@ -23,8 +23,9 @@ const MODELS = {
   PRIME: 'claude-haiku-4-5-20251001',  // Sophy reflection/crisis — re-pass the suicide-entry test before changing
 };
 // ═══════════════════════════════════════════════════════════════════════════
-const MAILCHIMP_API_KEY = defineSecret("MAILCHIMP_API_KEY");
-const MAILCHIMP_LIST_ID = defineSecret("MAILCHIMP_LIST_ID");
+const MAILCHIMP_API_KEY = defineSecret("MAILCHIMP_API_KEY"); // dead — subscription cancelled; remove in Connect sweep
+const MAILCHIMP_LIST_ID = defineSecret("MAILCHIMP_LIST_ID"); // dead — subscription cancelled; remove in Connect sweep
+const AC_API_KEY = defineSecret("AC_API_KEY"); // ActiveCampaign (pegasusrealm.api-us1.com), 2026-07-02
 const TWILIO_ACCOUNT_SID = defineSecret("TWILIO_ACCOUNT_SID");
 const TWILIO_AUTH_TOKEN = defineSecret("TWILIO_AUTH_TOKEN");
 const TWILIO_PHONE_NUMBER = defineSecret("TWILIO_PHONE_NUMBER");
@@ -4806,59 +4807,101 @@ async function ghostFreeMonthlyInsights(requestId) {
 */
 
 // === MailChimp Integration ===
-exports.addToMailchimp = onCall({ 
-  secrets: [MAILCHIMP_API_KEY, MAILCHIMP_LIST_ID] 
+// ═══════════════════════════════════════════════════════════════════════════
+// SIGNUP EMAIL SYNC → ActiveCampaign (2026-07-02).
+// Callable name kept as addToMailchimp for client back-compat (web auth.js
+// calls it fire-and-forget at signup) — Mailchimp subscription is DEAD and
+// this had been silently failing. Now: contact/sync → Master Contact List →
+// tags [platform tag + Audience], resolved by name, created if missing.
+// Mobile parity: call with { email, platform: 'mobile' }.
+// ═══════════════════════════════════════════════════════════════════════════
+exports.addToMailchimp = onCall({
+  secrets: [AC_API_KEY]
 }, async (request) => {
   const requestId = generateRequestId();
-  console.log(`[${requestId}] 📧 Adding email to MailChimp`);
-  
-  const { email } = request.data;
+  console.log(`[${requestId}] 📧 Syncing signup email to ActiveCampaign`);
+
+  const { email, platform } = request.data;
   if (!email) {
     console.error(`[${requestId}] ❌ Email is required`);
     throw new HttpsError('invalid-argument', 'Email is required');
   }
 
+  const AC_URL = 'https://pegasusrealm.api-us1.com';
+  const LIST_NAME = 'Master Contact List';
+  const headers = {
+    'Api-Token': AC_API_KEY.value(),
+    'Content-Type': 'application/json'
+  };
+
   try {
-    const apiKey = MAILCHIMP_API_KEY.value();
-    const listId = MAILCHIMP_LIST_ID.value();
-    const serverPrefix = apiKey.split('-')[1];
-    
-    const url = `https://${serverPrefix}.api.mailchimp.com/3.0/lists/${listId}/members`;
-    const body = {
-      email_address: email,
-      status: 'subscribed',
-      tags: ['InkWell Web']
-    };
-
-    console.log(`[${requestId}] 🔄 Calling MailChimp API for ${email}`);
-    const response = await fetch(url, {
+    // 1. Create-or-update the contact (idempotent)
+    const syncRes = await fetch(`${AC_URL}/api/3/contact/sync`, {
       method: 'POST',
-      headers: {
-        'Authorization': `apikey ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
+      headers,
+      body: JSON.stringify({ contact: { email } })
     });
+    if (!syncRes.ok) {
+      const errText = await syncRes.text();
+      console.error(`[${requestId}] ❌ AC contact/sync failed ${syncRes.status}: ${errText.slice(0, 300)}`);
+      throw new HttpsError('internal', 'ActiveCampaign contact sync failed');
+    }
+    const contactId = (await syncRes.json()).contact?.id;
+    if (!contactId) throw new HttpsError('internal', 'ActiveCampaign returned no contact id');
+    console.log(`[${requestId}] ✅ AC contact synced (id ${contactId})`);
 
-    if (!response.ok) {
-      const error = await response.json();
-      console.error(`[${requestId}] ❌ MailChimp API error:`, error);
-      throw new HttpsError('internal', error.detail || 'MailChimp error');
+    // 2. Subscribe to Master Contact List (resolved by name)
+    const listRes = await fetch(`${AC_URL}/api/3/lists?filters[name]=${encodeURIComponent(LIST_NAME)}`, { headers });
+    const listId = (await listRes.json()).lists?.[0]?.id;
+    if (listId) {
+      await fetch(`${AC_URL}/api/3/contactLists`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ contactList: { list: listId, contact: contactId, status: 1 } })
+      });
+      console.log(`[${requestId}] ✅ Subscribed to "${LIST_NAME}" (list ${listId})`);
+    } else {
+      console.error(`[${requestId}] ⚠️ List "${LIST_NAME}" not found in AC — contact created but not subscribed to a list`);
     }
 
-    const result = await response.json();
-    console.log(`[${requestId}] ✅ Successfully added ${email} to MailChimp with tag 'InkWell Web'`);
-    
-    return { 
+    // 3. Tags: platform tag + Audience (resolve by exact name, create if missing)
+    const tagNames = [platform === 'mobile' ? 'InkWell Mobile' : 'InkWell Web', 'Audience'];
+    for (const name of tagNames) {
+      let tagId = null;
+      const q = await fetch(`${AC_URL}/api/3/tags?search=${encodeURIComponent(name)}`, { headers });
+      const found = ((await q.json()).tags || []).find(t => t.tag === name);
+      if (found) {
+        tagId = found.id;
+      } else {
+        const created = await fetch(`${AC_URL}/api/3/tags`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ tag: { tag: name, tagType: 'contact', description: 'Auto-created by InkWell signup sync' } })
+        });
+        tagId = (await created.json()).tag?.id;
+        console.log(`[${requestId}] ➕ Created missing AC tag "${name}" (id ${tagId})`);
+      }
+      if (tagId) {
+        await fetch(`${AC_URL}/api/3/contactTags`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ contactTag: { contact: contactId, tag: tagId } })
+        });
+      }
+    }
+    console.log(`[${requestId}] ✅ Tagged: ${tagNames.join(', ')}`);
+
+    return {
       success: true,
-      message: 'Email added to MailChimp successfully',
+      message: 'Email synced to ActiveCampaign',
       email: email,
-      tags: ['InkWell Web']
+      tags: tagNames
     };
-    
+
   } catch (error) {
-    console.error(`[${requestId}] ❌ MailChimp integration failed:`, error);
-    throw new HttpsError('internal', `Failed to add email to MailChimp: ${error.message}`);
+    if (error instanceof HttpsError) throw error;
+    console.error(`[${requestId}] ❌ ActiveCampaign sync failed:`, error);
+    throw new HttpsError('internal', `Failed to sync email to ActiveCampaign: ${error.message}`);
   }
 });
 
