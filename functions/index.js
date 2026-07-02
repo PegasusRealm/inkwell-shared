@@ -712,7 +712,15 @@ Keep your reflections brief, focused, and emotionally clear — no more than 2�
 
 Begin your response immediately with your reflection - no introductions or narrative text.
 
-IMPORTANT: This is a one-time reflection, not a conversation. Do not include phrases like "Let me know if you'd like to discuss further", "Would you like me to help with...", "Feel free to share more", or any other conversational follow-ups. Just provide your reflection and end naturally.`;
+IMPORTANT: This is a one-time reflection, not a conversation. Do not include phrases like "Let me know if you'd like to discuss further", "Would you like me to help with...", "Feel free to share more", or any other conversational follow-ups. Just provide your reflection and end naturally.
+
+CRISIS RESPONSE (this overrides everything above):
+If the entry suggests the person may be thinking about suicide, self-harm, or not wanting to be alive - including indirect phrasing like "I don't want to be here anymore", "everyone would be better off without me", "I can't do this anymore", "what's the point" - you MUST:
+1. Respond first with warmth and full presence. Take it seriously. Do not analyze, do not reframe, do not offer a journaling insight or a silver lining.
+2. ALWAYS include these resources, exactly: call or text 988 (Suicide & Crisis Lifeline), text HOME to 741741 (Crisis Text Line), and for veterans call 988 then press 1.
+3. Gently encourage reaching out to a real person right now - a professional, a trusted friend, or one of the lines above.
+4. Remind them InkWell is a wellness tool, not crisis support, and that talking to a human right now matters more than journaling.
+When in doubt about whether an entry qualifies, include the resources. A wrongly included resource costs nothing. A wrongly omitted one can cost everything.`;
 
     // Call Anthropic with enhanced context — PRIME role: reflection/crisis path,
     // safety-gated (suicide-entry test required before any model change)
@@ -779,6 +787,22 @@ IMPORTANT: This is a one-time reflection, not a conversation. Do not include phr
       .replace(/I\s+sense\s+there\s+is\s+an\s+important\s+wish/gi, '') // Remove specific AI prompt leakage
       .replace(/^Let's\s+take\s+a\s+moment\s+to\s+vividly\s+imagine/gi, '') // Remove prompt instruction leakage
       .trim();
+
+    // ═══ CRISIS BACKSTOP (deterministic, 2026-07-01) ═══
+    // The system prompt instructs crisis resources, but the model is not the
+    // guarantee — this is. If the ENTRY matches crisis language and the reply
+    // doesn't already carry the resources, append them. Screens the user's
+    // words, not the model's mood. When in doubt, resources go in.
+    try {
+      const crisisPattern = /suicid|kill (myself|me)|end (my|it) (life|all)|don'?t want to (be here|live|exist|wake up)|do not want to (be here|live|exist)|better off without me|no reason to (live|go on)|want (to die|it to end)|wanna die|hurt (myself|me on purpose)|self.?harm|not worth living|take my (own )?life|can'?t go on|ready to give up on (life|everything)/i;
+      const normalizedEntry = String(entry || '').replace(/[‘’ʼ]/g, "'"); // curly apostrophes → straight (mobile keyboards)
+      if (normalizedEntry && crisisPattern.test(normalizedEntry) && !/988/.test(cleanedInsight)) {
+        console.warn(`[${requestId}] 🚨 CRISIS BACKSTOP FIRED - entry matched crisis language, model reply lacked resources. Appending.`);
+        cleanedInsight += "\n\nOne more thing, and it matters: if any part of you is thinking about not being here, please reach out to a real person right now. Call or text 988 (Suicide & Crisis Lifeline), or text HOME to 741741 (Crisis Text Line). Veterans can call 988 and press 1. InkWell is a wellness tool, not crisis support. Talking to a human right now matters more than journaling.";
+      }
+    } catch (backstopError) {
+      console.error(`[${requestId}] Crisis backstop check failed (non-blocking):`, backstopError.message);
+    }
 
     res.status(200).json({ 
       insight: cleanedInsight,
