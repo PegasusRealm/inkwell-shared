@@ -539,13 +539,16 @@ exports.gratitudeEngine = onRequest({ secrets: [ANTHROPIC_API_KEY, SENDGRID_API_
         });
       }
       const material = gratitudes.slice(0, 40).join('\n- ');
-      const sys = `You write ONE mental-subtraction gratitude prompt (based on Koo, Algoe, Wilson & Gilbert, 2008): the user imagines a specific good thing from THEIR OWN life having never happened. Rules: second person; reference ONE concrete thing drawn from their gratitude history below; under 55 words; end with a question asking what would be missing; warm, plain language; no advice, no clinical terms, no preamble — output only the prompt text.`;
+      const sys = `You write ONE mental-subtraction gratitude prompt (based on Koo, Algoe, Wilson & Gilbert, 2008): the user imagines a specific good thing from THEIR OWN life having never happened. Rules: second person; reference ONE concrete thing drawn from their gratitude history below; under 55 words; end with a question asking what would be missing; warm, plain language; NEVER use em dashes, en dashes, or semicolons (commas and periods only); no advice, no clinical terms, no preamble; output only the prompt text.`;
       const data = await callAnthropicWithRetry({
         model: MODELS.FAST,
         max_tokens: 160,
         messages: [{ role: 'user', content: `${sys}\n\nTheir recent gratitudes:\n- ${material}` }]
       }, 'gratitudeEngine.personalSubtraction', requestId);
-      const prompt = data.content[0].text.trim().replace(/^["']|["']$/g, '');
+      const prompt = data.content[0].text.trim()
+        .replace(/^["']|["']$/g, '')
+        .replace(/\s*[—–]\s*/g, ', ')
+        .replace(/;\s*/g, '. ');
       console.log(`[${requestId}] personalSubtraction success`);
       return res.status(200).json({ prompt });
     }
@@ -559,13 +562,25 @@ exports.gratitudeEngine = onRequest({ secrets: [ANTHROPIC_API_KEY, SENDGRID_API_
       if (notes.length < 5) {
         return res.status(400).json({ error: 'Jot a few rough notes first — who they are, what they did, what it meant.' });
       }
-      const sys = `You help someone draft a gratitude letter${recipientName ? ` to ${recipientName}` : ''} (the gratitude-visit exercise, Seligman et al. 2005). Write 120-180 words in the writer's plain first-person voice using their notes. Be specific and concrete about what the person did, what it cost them, and what it changed. No flowery clichés, no "words cannot express," no advice. Output ONLY the letter body, starting with "Dear ${recipientName || '___'}," and ending with a simple sign-off line without a name.`;
+      const sys = `You help someone draft a gratitude letter${recipientName ? ` to ${recipientName}` : ''} (the gratitude-visit exercise, Seligman et al. 2005). Write 120-180 words in the writer's plain first-person voice using their notes. Be specific and concrete about what the person did, what it cost them, and what it changed.
+
+VOICE RULES (strict — this must read like a person, not an assistant):
+- NEVER use em dashes or en dashes. Use commas, periods, or start a new sentence.
+- No semicolons. Short, plain sentences. Contractions are good.
+- No flowery cliches, no "words cannot express," no "truly," no "journey," no "grateful beyond measure."
+- Keep the writer's own words and phrasing from their notes wherever possible, including their imperfections.
+- No advice, no lists, no summary line.
+
+Output ONLY the letter body, starting with "Dear ${recipientName || '___'}," and ending with a simple sign-off line without a name.`;
       const data = await callAnthropicWithRetry({
         model: MODELS.FAST,
         max_tokens: 400,
         messages: [{ role: 'user', content: `${sys}\n\nTheir rough notes:\n${notes}` }]
       }, 'gratitudeEngine.letterAssist', requestId);
-      const draft = data.content[0].text.trim();
+      // Belt-and-suspenders: strip AI-tell punctuation even if the model slips
+      const draft = data.content[0].text.trim()
+        .replace(/\s*[—–]\s*/g, ', ')
+        .replace(/;\s*/g, '. ');
       console.log(`[${requestId}] letterAssist success`);
       return res.status(200).json({ draft });
     }
