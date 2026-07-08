@@ -22,6 +22,16 @@ const MODELS = {
   FAST: 'claude-haiku-4-5-20251001',   // utility: prompts, cleanup, subtraction, letters, insights
   PRIME: 'claude-haiku-4-5-20251001',  // Sophy reflection/crisis — re-pass the suicide-entry test before changing
 };
+// PROVIDER FAILOVER (2026-07-02, Adam-approved): if Anthropic is unavailable
+// (outage-class failures ONLY — 5xx/429-exhausted/timeouts/MODEL_RETIRED, never
+// content refusals), roles fail over to the provider below. Failover is LOUD
+// (🚨 FAILOVER log). Context: Anthropic model retirement took all AI features
+// down for 10 weeks (Apr-Jul 2026); July 2026 export-control actions proved
+// models can be yanked with days of notice.
+const MODEL_FALLBACKS = {
+  FAST: { provider: 'openai', model: 'gpt-4o-mini' },
+  PRIME: null, // SAFETY GATE: no crisis-path fallback until the fallback model passes the suicide-entry test
+};
 // ═══════════════════════════════════════════════════════════════════════════
 const MAILCHIMP_API_KEY = defineSecret("MAILCHIMP_API_KEY"); // dead — subscription cancelled; remove in Connect sweep
 const MAILCHIMP_LIST_ID = defineSecret("MAILCHIMP_LIST_ID"); // dead — subscription cancelled; remove in Connect sweep
@@ -314,7 +324,58 @@ function mapErrorToUserMessage(error, functionContext = 'system') {
 }
 
 // Helper: Robust OpenAI API call with timeout, retries, and proper logging
+// Provider-failover wrapper (2026-07-02). Call sites keep this name; pass
+// options.role ('FAST'|'PRIME') to enable failover per MODEL_FALLBACKS.
 async function callAnthropicWithRetry(options, functionName, requestId) {
+  const role = options.role;
+  if (role) delete options.role; // never send unknown fields to the API
+  try {
+    return await callAnthropicCore(options, functionName, requestId);
+  } catch (err) {
+    const fb = role ? MODEL_FALLBACKS[role] : null;
+    if (fb && err.outage) {
+      console.error(`[${requestId}] 🚨 FAILOVER: Anthropic unavailable for ${functionName} (${err.message}) — serving via ${fb.provider}:${fb.model}`);
+      return await callOpenAIFallback(fb.model, options, functionName, requestId);
+    }
+    throw err;
+  }
+}
+
+// OpenAI fallback — returns an Anthropic-shaped response so call sites need no changes
+async function callOpenAIFallback(fbModel, options, functionName, requestId) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${OPENAI_API_KEY.value()}`
+      },
+      body: JSON.stringify({
+        model: fbModel,
+        max_tokens: options.max_tokens || 400,
+        messages: options.messages
+      }),
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) {
+      const t = await response.text();
+      throw new Error(`OpenAI fallback error ${response.status}: ${t.slice(0, 200)}`);
+    }
+    const data = await response.json();
+    const text = data.choices?.[0]?.message?.content || '';
+    if (!text) throw new Error('OpenAI fallback returned empty content');
+    console.log(`[${requestId}] ✅ ${functionName} served via FAILOVER ${fbModel} - usage: ${JSON.stringify(data.usage || {})}`);
+    return { content: [{ text }], usage: data.usage || {} };
+  } catch (e) {
+    clearTimeout(timeoutId);
+    throw e;
+  }
+}
+
+async function callAnthropicCore(options, functionName, requestId) {
   const maxRetries = 3;
   let attempt = 0;
   
@@ -354,7 +415,9 @@ async function callAnthropicWithRetry(options, functionName, requestId) {
       // This is the failure mode that hid for 10 weeks (claude-3-haiku retirement).
       if (response.status === 404) {
         console.error(`[${requestId}] 🚨 MODEL RETIRED OR UNKNOWN: "${options.model}" returned 404 from Anthropic. Update the MODELS routing block at the top of index.js. ALL features using this role are down.`);
-        throw new Error(`MODEL_RETIRED: ${options.model}`);
+        const retiredErr = new Error(`MODEL_RETIRED: ${options.model}`);
+        retiredErr.outage = true; // failover-eligible
+        throw retiredErr;
       }
 
       // Handle specific error codes
@@ -378,8 +441,10 @@ async function callAnthropicWithRetry(options, functionName, requestId) {
       // Create a technical error for mapping
       const technicalError = new Error(`Anthropic API error: ${response.status} ${response.statusText}`);
       const userError = mapErrorToUserMessage(technicalError, functionName);
-      throw new Error(userError.message);
-      
+      const finalErr = new Error(userError.message);
+      finalErr.outage = (response.status === 429 || response.status >= 500); // 4xx = our bug, not an outage
+      throw finalErr;
+
     } catch (error) {
       clearTimeout(timeoutId);
       
@@ -392,24 +457,29 @@ async function callAnthropicWithRetry(options, functionName, requestId) {
           continue;
         }
         const userError = mapErrorToUserMessage(error, functionName);
-        throw new Error(userError.message);
+        const timeoutErr = new Error(userError.message);
+        timeoutErr.outage = true; // timeouts = failover-eligible
+        throw timeoutErr;
       }
-      
+
       // Network or other errors
       console.error(`[${requestId}] Anthropic network error on attempt ${attempt}:`, error.message);
+      if (error.outage !== undefined) throw error; // already-classified errors (MODEL_RETIRED, 4xx, exhausted 5xx) pass straight up
       if (attempt < maxRetries) {
         const delay = Math.pow(2, attempt - 1) * 1000;
         await sleep(delay);
         continue;
       }
-      
+
       const userError = mapErrorToUserMessage(error, functionName);
-      throw new Error(userError.message);
+      const netErr = new Error(userError.message);
+      netErr.outage = true; // exhausted network retries = failover-eligible
+      throw netErr;
     }
   }
 }
 
-exports.generatePrompt = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req, res) => {
+exports.generatePrompt = onRequest({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -445,6 +515,7 @@ exports.generatePrompt = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req,
     const data = await callAnthropicWithRetry(
       {
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 200,
         messages: [
           { role: "user", content: `${systemPrompt}\n\n${promptContent}` }
@@ -494,7 +565,7 @@ exports.generatePrompt = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req,
 //  - emailLetter (any signed-in user): sends the letter to the USER'S OWN
 //    email only — recipient is never a request parameter.
 // ═══════════════════════════════════════════════════════════════════════════
-exports.gratitudeEngine = onRequest({ secrets: [ANTHROPIC_API_KEY, SENDGRID_API_KEY] }, async (req, res) => {
+exports.gratitudeEngine = onRequest({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY, SENDGRID_API_KEY] }, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -543,6 +614,7 @@ exports.gratitudeEngine = onRequest({ secrets: [ANTHROPIC_API_KEY, SENDGRID_API_
       const sys = `You write ONE mental-subtraction gratitude prompt (based on Koo, Algoe, Wilson & Gilbert, 2008): the user imagines a specific good thing from THEIR OWN life having never happened. Rules: second person; reference ONE concrete thing drawn from their gratitude history below; under 55 words; end with a question asking what would be missing; warm, plain language; NEVER use em dashes, en dashes, or semicolons (commas and periods only); no advice, no clinical terms, no preamble; output only the prompt text.`;
       const data = await callAnthropicWithRetry({
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 160,
         messages: [{ role: 'user', content: `${sys}\n\nTheir recent gratitudes:\n- ${material}` }]
       }, 'gratitudeEngine.personalSubtraction', requestId);
@@ -575,13 +647,22 @@ VOICE RULES (strict — this must read like a person, not an assistant):
 Output ONLY the letter body, starting with "Dear ${recipientName || '___'}," and ending with a simple sign-off line without a name.`;
       const data = await callAnthropicWithRetry({
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 400,
         messages: [{ role: 'user', content: `${sys}\n\nTheir rough notes:\n${notes}` }]
       }, 'gratitudeEngine.letterAssist', requestId);
       // Belt-and-suspenders: strip AI-tell punctuation even if the model slips
-      const draft = data.content[0].text.trim()
+      let draft = data.content[0].text.trim()
         .replace(/\s*[—–]\s*/g, ', ')
         .replace(/;\s*/g, '. ');
+      // Crisis backstop (uniform with askSophy/plannerAssist): screen the user's notes
+      try {
+        const crisisPattern = /suicid|kill (myself|me)|end (my|it) (life|all)|don'?t want to (be here|live|exist|wake up)|do not want to (be here|live|exist)|better off without me|no reason to (live|go on)|want (to die|it to end)|wanna die|hurt (myself|me on purpose)|self.?harm|not worth living|take my (own )?life|can'?t go on|ready to give up on (life|everything)/i;
+        if (crisisPattern.test(String(notes).replace(/[\u2018\u2019]/g, "'")) && !/988/.test(draft)) {
+          console.warn(`[${requestId}] 🚨 CRISIS BACKSTOP FIRED in letterAssist`);
+          draft += "\n\nOne more thing, and it matters: if any part of you is thinking about not being here, please reach out to a real person right now. Call or text 988 (Suicide & Crisis Lifeline), or text HOME to 741741 (Crisis Text Line). Veterans can call 988 and press 1. InkWell is a wellness tool, not crisis support.";
+        }
+      } catch (e) { console.error(`[${requestId}] letterAssist backstop failed (non-blocking):`, e.message); }
       console.log(`[${requestId}] letterAssist success`);
       return res.status(200).json({ draft });
     }
@@ -621,8 +702,212 @@ Output ONLY the letter body, starting with "Dear ${recipientName || '___'}," and
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PRACTICE SUMMARY (2026-07-02)
+// Client-generated usage summary a user can forward to their practitioner.
+// LAWS (product decisions, do not drift):
+//  - FREE tier. Never gate this behind Plus. Practitioner referrals depend
+//    on the free app being fully sufficient for the client.
+//  - Sent to the USER'S OWN email only. InkWell never contacts a practitioner.
+//  - Usage metadata ONLY. Never entry text, titles, or tag labels.
+// ═══════════════════════════════════════════════════════════════════════════
+exports.practiceSummary = onRequest({ secrets: [SENDGRID_API_KEY] }, async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(204).send('');
+  const requestId = generateRequestId();
+  try {
+    const authHeader = req.headers.authorization?.replace('Bearer ', '');
+    if (!authHeader) return res.status(401).json({ error: 'Sign in required.' });
+    const decoded = await admin.auth().verifyIdToken(authHeader);
+    const userId = decoded.uid;
+    const email = decoded.email;
+    if (!email) return res.status(400).json({ error: 'No email address on your account.' });
+
+    const days = [7, 30, 90].includes(Number(req.body.days)) ? Number(req.body.days) : 30;
+
+    // Light abuse guard: 1 send per minute per user
+    const guardRef = admin.firestore().collection('users').doc(userId);
+    const g = (await guardRef.get()).data() || {};
+    const last = g.lastPracticeSummaryAt?.toMillis ? g.lastPracticeSummaryAt.toMillis() : 0;
+    if (Date.now() - last < 60000) {
+      return res.status(429).json({ error: 'One summary a minute. Try again shortly.' });
+    }
+
+    const cutoff = Date.now() - days * 86400000;
+    const snap = await admin.firestore().collection('journalEntries')
+      .where('userId', '==', userId).get();
+
+    const dayset = new Set();
+    let total = 0, words = 0, voice = 0;
+    const feelPairs = []; // self-rated 1-5 before/after practices
+    const mix = { gratitude: 0, reframe: 0, sprint: 0, inkblot: 0, journal: 0 };
+    const tod = { morning: 0, afternoon: 0, evening: 0 };
+    snap.forEach(d => {
+      const e = d.data();
+      let t = e.createdAt?.toDate?.();
+      if (!t && typeof e.createdAt === 'string') t = new Date(e.createdAt);
+      if (!t || isNaN(t) || t.getTime() < cutoff) return;
+      total++;
+      dayset.add(t.toISOString().slice(0, 10));
+      words += String(e.text || '').split(/\s+/).filter(Boolean).length;
+      if (e.isVoiceEntry) voice++;
+      if (e.feelBefore >= 1 && e.feelAfter >= 1) feelPairs.push(e.feelAfter - e.feelBefore);
+      const tags = e.tags || [];
+      if (e.entryMode === 'gratitude' || tags.includes('gratitude')) mix.gratitude++;
+      else if (tags.includes('reframe')) mix.reframe++;
+      else if (tags.includes('sprint')) mix.sprint++;
+      else if (tags.includes('inkblot')) mix.inkblot++;
+      else mix.journal++;
+      const h = t.getHours();
+      if (h < 12) tod.morning++; else if (h < 17) tod.afternoon++; else tod.evening++;
+    });
+
+    // Longest consecutive-day run inside the period
+    const sorted = [...dayset].sort();
+    let streak = 0, run = 0, prev = null;
+    for (const k of sorted) {
+      run = (prev && (new Date(k) - new Date(prev) === 86400000)) ? run + 1 : 1;
+      if (run > streak) streak = run;
+      prev = k;
+    }
+
+    const mixLines = Object.entries({
+      'Open journaling': mix.journal,
+      'Gratitude practices': mix.gratitude,
+      'Reframe (perspective) practices': mix.reframe,
+      'Writing sprints': mix.sprint,
+      'Quick captures (InkBlot)': mix.inkblot
+    }).filter(([, v]) => v > 0).map(([k, v]) => `  ${k}: ${v}`).join('\n') || '  (no entries in this period)';
+    const todTop = Object.entries(tod).sort((a, b) => b[1] - a[1])[0];
+
+    const body = `INKWELL PRACTICE SUMMARY
+Period: last ${days} days
+Generated: ${new Date().toISOString().slice(0, 10)}
+Account: ${email}
+
+ENGAGEMENT
+Entries written: ${total}
+Days with at least one entry: ${dayset.size} of ${days}
+Longest consecutive-day run: ${streak} day${streak === 1 ? '' : 's'}
+Total words written: ${words}${total ? `\nMost common writing time: ${todTop[0]}` : ''}${voice ? `\nVoice entries: ${voice}` : ''}
+
+PRACTICE MIX
+${mixLines}${feelPairs.length >= 3 ? `\n\nSELF-RATED SHIFT\nBefore and after practices, on a 1 to 5 heaviness scale the account owner\nrates optionally: average change ${(feelPairs.reduce((a, b) => a + b, 0) / feelPairs.length).toFixed(1)} across ${feelPairs.length} rated practices.\n(A self-rated feel, not a clinical measure.)` : ''}
+
+ABOUT THIS SUMMARY
+This summary shows usage patterns only. It contains no journal content,
+no titles, and no tags. It was generated and shared by the account owner,
+at their own choice. InkWell is a wellness journal, not a medical record
+or a clinical tool.
+
+InkWell, inkwelljournal.io`;
+
+    sgMail.setApiKey(SENDGRID_API_KEY.value());
+    await sgMail.send({
+      to: email, // own email ONLY, never a third party
+      from: 'support@inkwelljournal.io',
+      subject: `Your InkWell Practice Summary (last ${days} days)`,
+      text: body
+    });
+    await guardRef.set({ lastPracticeSummaryAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    console.log(`[${requestId}] practiceSummary sent to self (${days}d, ${total} entries)`);
+    return res.status(200).json({ sent: true });
+  } catch (error) {
+    console.error(`[${requestId}] practiceSummary failed:`, error.message);
+    res.set('Access-Control-Allow-Origin', '*');
+    return res.status(500).json({ error: 'Something hiccuped. Please try again.' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PLANNER ASSIST (2026-07-02) — Sophy inside the Values-Based Goal Planner.
+// One callable, three steps. EXEMPT from the daily Sophy tease-limit (Adam:
+// UX beats trivial AI cost) but capped server-side at 15 calls/day/user.
+// steps:
+//   vivid      — asks 2-3 sensory questions to deepen the day-in-life vision
+//   seed       — suggests candidate goals from vision + top values + recent journal
+//   wantshould — reflects on the user's pros/cons; flags wants vs shoulds
+// ═══════════════════════════════════════════════════════════════════════════
+exports.plannerAssist = onRequest({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, async (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.status(204).send('');
+  const requestId = generateRequestId();
+  try {
+    const authHeader = req.headers.authorization?.replace('Bearer ', '');
+    if (!authHeader) return res.status(401).json({ error: 'Sign in required.' });
+    const decoded = await admin.auth().verifyIdToken(authHeader);
+    const userId = decoded.uid;
+    const step = String(req.body.step || '');
+
+    // Server-side cap: 15 planner calls per day per user
+    const userRef = admin.firestore().collection('users').doc(userId);
+    const u = (await userRef.get()).data() || {};
+    const today = new Date().toISOString().slice(0, 10);
+    const used = (u.plannerAssistDate === today) ? (u.plannerAssistCount || 0) : 0;
+    if (used >= 15) return res.status(429).json({ error: "Sophy has helped a lot with this today. The planner keeps; come back tomorrow." });
+
+    const VOICE = `Write in Sophy's voice: warm, plain, second person. NEVER use em dashes, en dashes, or semicolons (commas and periods only). No clinical terms, no advice-dumping, no preamble, no lists unless asked. If anything in the user's text suggests self-harm or crisis, gently include: call or text 988, or text HOME to 741741, veterans press 1, and say a human matters more than planning right now.`;
+
+    let prompt = null;
+    if (step === 'vivid') {
+      const vision = String(req.body.vision || '').trim().slice(0, 4000);
+      if (vision.length < 20) return res.status(400).json({ error: 'Write a little of your day first, then I can help deepen it.' });
+      prompt = `${VOICE}\n\nThe user is writing "a day in my life, 15 years from now." Read their draft, then ask exactly 2 or 3 short sensory questions that would make the scene more vivid and specific. Reference concrete details THEY wrote. Under 80 words total. Output only the questions, each on its own line.\n\nTheir draft:\n${vision}`;
+    } else if (step === 'seed') {
+      const vision = String(req.body.vision || '').trim().slice(0, 3000);
+      const values = (Array.isArray(req.body.topValues) ? req.body.topValues : []).slice(0, 10).map(v => String(v).slice(0, 40)).join(', ');
+      // Recent journal themes (titles + first 200 chars, newest 15) — content stays server-side
+      const snap = await admin.firestore().collection('journalEntries')
+        .where('userId', '==', userId).orderBy('createdAt', 'desc').limit(15).get();
+      const themes = [];
+      snap.forEach(d => { const e = d.data(); if (e.text) themes.push(String(e.text).slice(0, 200)); });
+      prompt = `${VOICE}\n\nThe user is hunting for a goal worth wanting. Suggest exactly 3 candidate goals. Each: one line, specific and startable within 90 days, grounded in what you see below. After each goal add one short "because" clause tying it to their values or journal themes. Under 120 words total. No numbering headers, just three lines starting with a dash.\n\nTheir top values: ${values || '(not provided)'}\nTheir 15-year vision:\n${vision || '(not written yet)'}\n\nRecent journal excerpts:\n${themes.join('\n---\n') || '(no entries yet)'}`;
+    } else if (step === 'dedupe') {
+      const ideas = (Array.isArray(req.body.ideas) ? req.body.ideas : []).slice(0, 60).map(x => String(x).slice(0, 200));
+      if (ideas.length < 3) return res.status(400).json({ error: 'Add some ideas first.' });
+      prompt = `You are auditing a goal brainstorm for duplicates. People reword the same idea to hit a count, and the point of this exercise is VOLUME OF DISTINCT THINKING. Group any entries that are the same underlying idea in different words. Be strict about rewordings, lenient about genuinely different angles.\n\nOutput format, exactly:\nLine 1: DISTINCT: <number of truly distinct ideas>\nThen, ONLY if there are duplicate groups, in Sophy's warm plain voice (no em dashes, no semicolons), name each group in one short line like: "X, Y and Z are the same idea wearing different hats." Then one encouraging line pushing them past the obvious into the silly and impossible. Under 90 words after line 1. If everything is distinct, after line 1 write one short congratulation only.\n\nThe list:\n${ideas.map((x, i) => (i + 1) + '. ' + x).join('\n')}`;
+    } else if (step === 'wantshould') {
+      const notes = String(req.body.notes || '').trim().slice(0, 4000);
+      if (notes.length < 20) return res.status(400).json({ error: 'Fill in some pros and cons first, then I can reflect.' });
+      prompt = `${VOICE}\n\nThe user compared candidate goals with pros and cons. Read their notes. In under 90 words: reflect back which option sounds like a WANT (their own motivation) and whether any sounds like a SHOULD (outside pressure), and why, using their own words as evidence. End with one question that helps them decide. Do not decide for them.\n\nTheir notes:\n${notes}`;
+    } else {
+      return res.status(400).json({ error: 'Unknown step.' });
+    }
+
+    const data = await callAnthropicWithRetry({
+      model: MODELS.FAST,
+      role: 'FAST',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    }, `plannerAssist.${step}`, requestId);
+    let text = data.content[0].text.trim().replace(/\s*[—–]\s*/g, ', ').replace(/;\s*/g, '. ');
+
+    // Deterministic crisis backstop (mirrors askSophy): screen the user's words
+    try {
+      const crisisPattern = /suicid|kill (myself|me)|end (my|it) (life|all)|don'?t want to (be here|live|exist|wake up)|do not want to (be here|live|exist)|better off without me|no reason to (live|go on)|want (to die|it to end)|wanna die|hurt (myself|me on purpose)|self.?harm|not worth living|take my (own )?life|can'?t go on|ready to give up on (life|everything)/i;
+      const userText = String((req.body.vision || '') + ' ' + (req.body.notes || '')).replace(/[\u2018\u2019]/g, "'");
+      if (crisisPattern.test(userText) && !/988/.test(text)) {
+        console.warn(`[${requestId}] 🚨 CRISIS BACKSTOP FIRED in plannerAssist`);
+        text += "\n\nOne more thing, and it matters: if any part of you is thinking about not being here, please reach out to a real person right now. Call or text 988 (Suicide & Crisis Lifeline), or text HOME to 741741 (Crisis Text Line). Veterans can call 988 and press 1. InkWell is a wellness tool, not crisis support. Talking to a human right now matters more than planning.";
+      }
+    } catch (e) { console.error(`[${requestId}] planner backstop failed (non-blocking):`, e.message); }
+
+    await userRef.set({ plannerAssistDate: today, plannerAssistCount: used + 1 }, { merge: true });
+    console.log(`[${requestId}] plannerAssist.${step} ok (${used + 1}/15 today)`);
+    return res.status(200).json({ text });
+  } catch (error) {
+    console.error(`[${requestId}] plannerAssist failed:`, error.message);
+    res.set('Access-Control-Allow-Origin', '*');
+    return res.status(500).json({ error: 'Something hiccuped. Please try again.' });
+  }
+});
+
 // Enhanced askSophy with behavioral pattern recognition
-exports.askSophy = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req, res) => {
+exports.askSophy = onRequest({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -631,6 +916,7 @@ exports.askSophy = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req, res) 
   try {
     const { entry, wishContext, behavioralTrigger } = req.body;
     const requestId = generateRequestId();
+    let sophyUserId = null; // for memory retrieval (2026-07-04)
     
     // Get user behavioral data for context
     let behaviorData = null;
@@ -639,6 +925,7 @@ exports.askSophy = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req, res) 
       if (authHeader) {
         const decodedToken = await admin.auth().verifyIdToken(authHeader);
         const userId = decodedToken.uid;
+        sophyUserId = userId;
         behaviorData = await getUserBehavioralContext(userId);
       }
     } catch (authError) {
@@ -715,6 +1002,8 @@ Begin your response immediately with your reflection - no introductions or narra
 
 IMPORTANT: This is a one-time reflection, not a conversation. Do not include phrases like "Let me know if you'd like to discuss further", "Would you like me to help with...", "Feel free to share more", or any other conversational follow-ups. Just provide your reflection and end naturally.
 
+CONTINUITY (allowed, sparingly): when the entry points at something unresolved or upcoming, you may end with ONE short forward-looking line. Caring anticipation, never an invitation to reply and never an assignment. The feeling of "I am curious where this goes" or "I hope tomorrow is gentler with you". At most half the time, and only when it fits naturally.
+
 CRISIS RESPONSE (this overrides everything above):
 If the entry suggests the person may be thinking about suicide, self-harm, or not wanting to be alive - including indirect phrasing like "I don't want to be here anymore", "everyone would be better off without me", "I can't do this anymore", "what's the point" - you MUST:
 1. Respond first with warmth and full presence. Take it seriously. Do not analyze, do not reframe, do not offer a journaling insight or a silver lining.
@@ -723,14 +1012,59 @@ If the entry suggests the person may be thinking about suicide, self-harm, or no
 4. Remind them InkWell is a wellness tool, not crisis support, and that talking to a human right now matters more than journaling.
 When in doubt about whether an entry qualifies, include the resources. A wrongly included resource costs nothing. A wrongly omitted one can cost everything.`;
 
+    // ═══ MEMORY RETRIEVAL (2026-07-04) — "the journal that learns you," literally.
+    // A cheap FAST pre-call picks up to 3 genuinely-connected past excerpts;
+    // PRIME may weave in one or two, always dated. Fail-open: any error here
+    // means Sophy simply reflects without memory, never blocks the reflection.
+    let memoryBlock = '';
+    try {
+      if (sophyUserId && String(entry || '').length > 40) {
+        const memSnap = await admin.firestore().collection('journalEntries')
+          .where('userId', '==', sophyUserId)
+          .orderBy('createdAt', 'desc')
+          .limit(40).get();
+        const past = [];
+        memSnap.forEach(d => {
+          const e = d.data();
+          const t = String(e.text || '').trim();
+          if (!t || t === String(entry).trim()) return; // skip empties + the entry being reflected
+          let when = e.createdAt?.toDate?.();
+          if (!when && typeof e.createdAt === 'string') when = new Date(e.createdAt);
+          if (!when || isNaN(when)) return;
+          past.push({ when: when.toISOString().slice(0, 10), text: t.slice(0, 220) });
+        });
+        if (past.length >= 3) {
+          const listing = past.map((p, i) => `[${i}] (${p.when}) ${p.text}`).join('\n');
+          const pick = await callAnthropicWithRetry({
+            model: MODELS.FAST,
+            role: 'FAST',
+            max_tokens: 30,
+            messages: [{ role: 'user', content: `Today's journal entry:\n${String(entry).slice(0, 1500)}\n\nPast excerpts from the same person:\n${listing}\n\nWhich past excerpts genuinely connect to today's entry (same thread, meaningful contrast, or visible progress)? Reply with ONLY the indices comma-separated (max 3), or NONE.` }]
+          }, 'askSophy.memoryPick', requestId);
+          const raw = pick.content[0].text.trim();
+          if (!/NONE/i.test(raw)) {
+            const idx = (raw.match(/\d+/g) || []).map(Number).filter(i => i >= 0 && i < past.length).slice(0, 3);
+            if (idx.length) {
+              memoryBlock = '\n\nMEMORY (excerpts from this person\'s own past entries. Weave in AT MOST one or two, ONLY where genuinely relevant, and always say when it was written in natural language like "a few weeks ago you wrote". If nothing truly connects, use none. Never resurface a past dark moment unless today\'s entry is about that same struggle):\n' +
+                idx.map(i => `- (${past[i].when}) "${past[i].text}"`).join('\n');
+              console.log(`[${requestId}] memory: ${idx.length} excerpt(s) attached`);
+            }
+          }
+        }
+      }
+    } catch (memErr) {
+      console.warn(`[${requestId}] memory retrieval skipped (non-blocking):`, memErr.message);
+    }
+
     // Call Anthropic with enhanced context — PRIME role: reflection/crisis path,
     // safety-gated (suicide-entry test required before any model change)
     const data = await callAnthropicWithRetry(
       {
         model: MODELS.PRIME,
+        role: 'PRIME',
         max_tokens: 400,
         messages: [
-          { role: "user", content: `${systemPrompt}\n\nUser entry: ${entry}` }
+          { role: "user", content: `${systemPrompt}${memoryBlock}\n\nUser entry: ${entry}` }
         ]
       },
       "askSophy",
@@ -823,7 +1157,7 @@ When in doubt about whether an entry qualifies, include the resources. A wrongly
 
 // Generate Period Insights (7-day or 30-day pattern analysis)
 exports.generatePeriodInsights = onRequest({ 
-  secrets: [ANTHROPIC_API_KEY],
+  secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY],
   invoker: 'public' // Allow unauthenticated HTTP requests (we handle auth via Firebase token)
 }, async (req, res) => {
   // Set CORS headers for ALL responses (including errors)
@@ -959,6 +1293,7 @@ IMPORTANT: Respond directly - no stage directions, no meta-text, no "Dear..." op
     const data = await callAnthropicWithRetry(
       {
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 600,
         messages: [
           { role: "user", content: `${systemPrompt}\n\nJOURNAL ENTRIES FROM THE PAST ${periodLabel.toUpperCase()}:\n\n${entryText}` }
@@ -1086,7 +1421,7 @@ async function trackInterventionOutcome(userId, trigger, response) {
 }
 
 // Check for behavioral triggers and suggest interventions
-exports.checkUserBehavioralTriggers = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req, res) => {
+exports.checkUserBehavioralTriggers = onRequest({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, async (req, res) => {
   res.set('Access-Control-Allow-Origin', '*');
   res.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -1231,7 +1566,7 @@ exports.loadManifest = onCall(async (data, context) => {
 
 
 // Ask Sophy to refine manifest statement
-exports.refineManifest = onCall({ secrets: [ANTHROPIC_API_KEY] }, async (data, context) => {
+exports.refineManifest = onCall({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, async (data, context) => {
   const uid = context.auth?.uid;
   if (!uid) {
     throw new HttpsError("unauthenticated", "User must be authenticated.");
@@ -1253,6 +1588,7 @@ exports.refineManifest = onCall({ secrets: [ANTHROPIC_API_KEY] }, async (data, c
     const result = await callAnthropicWithRetry(
       {
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 300,
         messages: [
           { role: "user", content: `You are a journaling assistant that helps users articulate their vision and purpose in a supportive, emotionally aware tone.\n\n${prompt}` }
@@ -1293,7 +1629,7 @@ exports.refineManifest = onCall({ secrets: [ANTHROPIC_API_KEY] }, async (data, c
 });
 
 // Clean up rough voice transcript into readable text (HTTP endpoint with CORS)
-exports.cleanVoiceTranscript = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req, res) => {
+exports.cleanVoiceTranscript = onRequest({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, async (req, res) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -1315,6 +1651,7 @@ exports.cleanVoiceTranscript = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async
     const data = await callAnthropicWithRetry(
       {
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 300,
         messages: [
           {
@@ -1375,7 +1712,7 @@ ${transcript}`
 
 // Enhanced voice processing with emotional analysis
 exports.processVoiceWithEmotion = onRequest({ 
-  secrets: [ANTHROPIC_API_KEY],
+  secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY],
   memory: "256MiB",
   timeoutSeconds: 60
 }, async (req, res) => {
@@ -1463,6 +1800,7 @@ async function cleanTranscriptWithAI(transcript) {
   const data = await callAnthropicWithRetry(
     {
       model: MODELS.FAST,
+        role: 'FAST',
       max_tokens: 300,
       messages: [
         {
@@ -1539,6 +1877,7 @@ Respond in JSON format only:
     const data = await callAnthropicWithRetry(
       {
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 300,
         messages: [{ role: 'user', content: prompt }]
       },
@@ -1591,6 +1930,7 @@ Respond as Sophy would - warm, encouraging, and focused on the person's wellbein
     const data = await callAnthropicWithRetry(
       {
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 80,
         messages: [{ role: 'user', content: prompt }]
       },
@@ -1605,7 +1945,7 @@ Respond as Sophy would - warm, encouraging, and focused on the person's wellbein
   }
 }
 
-exports.embedAndStoreEntry = onRequest({ secrets: [ANTHROPIC_API_KEY] }, (req, res) => {
+exports.embedAndStoreEntry = onRequest({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, (req, res) => {
   res.set("Access-Control-Allow-Origin", "*");
   res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -1685,7 +2025,7 @@ exports.embedAndStoreEntry = onRequest({ secrets: [ANTHROPIC_API_KEY] }, (req, r
 });
 
 // New semantic search function using Anthropic
-exports.semanticSearch = onRequest({ secrets: [ANTHROPIC_API_KEY] }, async (req, res) => {
+exports.semanticSearch = onRequest({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, async (req, res) => {
   const requestId = generateRequestId();
   console.log(`[${requestId}] Semantic search request started`);
   
@@ -1800,6 +2140,7 @@ If no entries are meaningfully relevant, return an empty array: []`;
     const result = await callAnthropicWithRetry(
       {
         model: MODELS.FAST,
+        role: 'FAST',
         max_tokens: 500,
         messages: [
           { role: "user", content: analysisPrompt }
@@ -5082,7 +5423,7 @@ async function calculateDaysSinceLastUpdate(userId, wishId) {
 }
 
 // Enhanced WISH lifecycle tracking
-exports.trackWishBehavior = onCall({ secrets: [ANTHROPIC_API_KEY] }, async (request) => {
+exports.trackWishBehavior = onCall({ secrets: [ANTHROPIC_API_KEY, OPENAI_API_KEY] }, async (request) => {
   const { auth } = request;
   const { wishId, action, sectionType, emotionalTone, complexity } = request.data;
   
@@ -6028,7 +6369,7 @@ const GRATITUDE_PROMPTS = [
 exports.scheduledDailyPrompts = onSchedule({
   schedule: 'every 3 hours',
   timeZone: 'UTC', // Run in UTC so we check all timezones
-  secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, ANTHROPIC_API_KEY]
+  secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER, ANTHROPIC_API_KEY, OPENAI_API_KEY]
 }, async (event) => {
   console.log('🕐 Running scheduled daily prompts check (all timezones)...');
   
@@ -6154,6 +6495,7 @@ exports.scheduledDailyPrompts = onSchedule({
                     // Generate personalized prompt
                     const aiResponse = await callAnthropicWithRetry({
                       model: MODELS.FAST,
+        role: 'FAST',
                       max_tokens: 150,
                       messages: [{
                         role: "user",
@@ -6900,7 +7242,7 @@ exports.createBillingPortalSession = onCall({
     // Create billing portal session
     const session = await stripe.billingPortal.sessions.create({
       customer: customerId,
-      return_url: `${request.data.returnUrl || 'https://inkwelljournal.io/app.html'}`,
+      return_url: `${request.data.returnUrl || 'https://inkwelljournal.io/app'}`,
     });
     
     console.log('✅ Billing portal session created for user:', userId);
