@@ -5797,6 +5797,25 @@ exports.sendTestSMS = onCall(
     if (!phoneNumber) {
       throw new HttpsError('invalid-argument', 'Phone number is required');
     }
+    if (!/^\+[1-9]\d{9,14}$/.test(String(phoneNumber))) {
+      throw new HttpsError('invalid-argument', 'Use the full number with country code, like +15551234567');
+    }
+
+    // Limit: 3 test texts per user per 24 hours (abuse protection, 2026-10-02)
+    const testRef = admin.firestore().collection('users').doc(request.auth.uid);
+    const allowed = await admin.firestore().runTransaction(async (tx) => {
+      const snap = await tx.get(testRef);
+      const log = (snap.exists && snap.data().smsTestLog) || {};
+      const now = Date.now();
+      const windowStart = typeof log.windowStart === 'number' ? log.windowStart : 0;
+      const count = (now - windowStart < 24 * 60 * 60 * 1000) ? (log.count || 0) : 0;
+      if (count >= 3) return false;
+      tx.set(testRef, { smsTestLog: { windowStart: count === 0 ? now : windowStart, count: count + 1 } }, { merge: true });
+      return true;
+    });
+    if (!allowed) {
+      throw new HttpsError('resource-exhausted', 'You can send up to 3 test texts a day. Try again tomorrow.');
+    }
 
     try {
       // Initialize Twilio client
@@ -5827,267 +5846,10 @@ exports.sendTestSMS = onCall(
   }
 );
 
-/**
- * Send WISH milestone reminder SMS
- */
-exports.sendWishMilestone = onCall(
-  { secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER] },
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError('unauthenticated', 'User must be logged in');
-    }
-
-    const { phoneNumber, milestone, daysElapsed, totalDays } = request.data;
-
-    if (!phoneNumber || !milestone) {
-      throw new HttpsError('invalid-argument', 'Phone number and milestone are required');
-    }
-
-    try {
-      // Server-side deduplication: Check if we've sent this milestone to this phone number this week
-      const now = new Date();
-      const weekStart = new Date(now);
-      weekStart.setDate(now.getDate() - now.getDay()); // Start of week (Sunday)
-      const weekKey = weekStart.toISOString().split('T')[0]; // YYYY-MM-DD of week start
-      const dedupeKey = `sms_${phoneNumber.replace(/\D/g, '')}_${milestone}_week_${weekKey}`;
-      
-      const dedupeRef = admin.firestore().collection('smsDeduplication').doc(dedupeKey);
-      const dedupeSnap = await dedupeRef.get();
-      
-      if (dedupeSnap.exists) {
-        console.log(`⚠️ Duplicate SMS blocked: ${dedupeKey} already sent this week`);
-        return {
-          success: true,
-          deduplicated: true,
-          message: 'SMS already sent for this milestone this week'
-        };
-      }
-      
-      // Mark as sent BEFORE sending to prevent race conditions
-      await dedupeRef.set({
-        phoneNumber: phoneNumber,
-        milestone: milestone,
-        sentAt: admin.firestore.FieldValue.serverTimestamp(),
-        userId: request.auth.uid
-      });
-      
-      const twilio = require('twilio');
-      const client = twilio(
-        TWILIO_ACCOUNT_SID.value(),
-        TWILIO_AUTH_TOKEN.value()
-      );
-
-      let messageText = '';
-      const appLink = '\n\nOpen InkWell: https://inkwelljournal.io/app.html';
-      
-      if (milestone === 'quarter') {
-        messageText = `🌱 InkWell: You're 25% through your WISH journey! (${daysElapsed}/${totalDays} days). Keep growing!${appLink}`;
-      } else if (milestone === 'half') {
-        messageText = `🍀 InkWell: Halfway there! You've completed ${daysElapsed} of ${totalDays} days. Your WISH is blooming!${appLink}`;
-      } else if (milestone === 'three-quarters') {
-        messageText = `🌿 InkWell: 75% complete! Only ${totalDays - daysElapsed} days left on your WISH journey. You're amazing!${appLink}`;
-      } else if (milestone === 'complete') {
-        messageText = `🌳 InkWell: Congratulations! You've completed your ${totalDays}-day WISH journey! Time to reflect and set a new WISH.${appLink}`;
-      } else {
-        messageText = `🌱 InkWell: WISH milestone reached! Keep up the great work on your journey.${appLink}`;
-      }
-
-      const message = await client.messages.create({
-        body: messageText,
-        from: TWILIO_PHONE_NUMBER.value(),
-        to: phoneNumber
-      });
-
-      console.log('✅ WISH milestone SMS sent:', message.sid);
-
-      return {
-        success: true,
-        messageSid: message.sid
-      };
-    } catch (error) {
-      console.error('❌ Failed to send WISH milestone SMS:', error);
-      throw new HttpsError('internal', `Failed to send SMS: ${error.message}`);
-    }
-  }
-);
-
-/**
- * Send daily journal prompt SMS
- */
-exports.sendDailyPrompt = onCall(
-  { secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER] },
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError('unauthenticated', 'User must be logged in');
-    }
-
-    const { phoneNumber, prompt } = request.data;
-
-    if (!phoneNumber) {
-      throw new HttpsError('invalid-argument', 'Phone number is required');
-    }
-
-    try {
-      const twilio = require('twilio');
-      const client = twilio(
-        TWILIO_ACCOUNT_SID.value(),
-        TWILIO_AUTH_TOKEN.value()
-      );
-
-      const defaultPrompt = '✍️ InkWell: Time to reflect. What went well today? What are you grateful for?';
-      const appLink = '\n\nTap to journal: https://inkwelljournal.io/app.html\n\nReply STOP to unsubscribe';
-      const messageText = `✍️ InkWell Daily Prompt:\n\n${prompt || defaultPrompt}${appLink}`;
-
-      const message = await client.messages.create({
-        body: messageText,
-        from: TWILIO_PHONE_NUMBER.value(),
-        to: phoneNumber
-      });
-
-      console.log('✅ Daily prompt SMS sent:', message.sid);
-
-      return {
-        success: true,
-        messageSid: message.sid
-      };
-    } catch (error) {
-      console.error('❌ Failed to send daily prompt SMS:', error);
-      throw new HttpsError('internal', `Failed to send SMS: ${error.message}`);
-    }
-  }
-);
-
-/**
- * Send daily gratitude prompt SMS - simple, clean, no links
- */
-exports.sendGratitudePrompt = onCall(
-  { secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER] },
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError('unauthenticated', 'User must be logged in');
-    }
-
-    const { phoneNumber, prompt } = request.data;
-
-    if (!phoneNumber) {
-      throw new HttpsError('invalid-argument', 'Phone number is required');
-    }
-
-    try {
-      const twilio = require('twilio');
-      const client = twilio(
-        TWILIO_ACCOUNT_SID.value(),
-        TWILIO_AUTH_TOKEN.value()
-      );
-
-      const defaultPrompt = '🙏 What small thing made you smile today?';
-      const messageText = `${prompt || defaultPrompt}\n\nReply STOP to unsubscribe`;
-
-      const message = await client.messages.create({
-        body: messageText,
-        from: TWILIO_PHONE_NUMBER.value(),
-        to: phoneNumber
-      });
-
-      console.log('✅ Gratitude prompt SMS sent:', message.sid);
-
-      return {
-        success: true,
-        messageSid: message.sid
-      };
-    } catch (error) {
-      console.error('❌ Failed to send gratitude prompt SMS:', error);
-      throw new HttpsError('internal', `Failed to send SMS: ${error.message}`);
-    }
-  }
-);
-
-/**
- * Send coach reply notification SMS
- */
-exports.sendCoachReplyNotification = onCall(
-  { secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER] },
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError('unauthenticated', 'User must be logged in');
-    }
-
-    const { phoneNumber, coachName } = request.data;
-
-    if (!phoneNumber) {
-      throw new HttpsError('invalid-argument', 'Phone number is required');
-    }
-
-    try {
-      const twilio = require('twilio');
-      const client = twilio(
-        TWILIO_ACCOUNT_SID.value(),
-        TWILIO_AUTH_TOKEN.value()
-      );
-
-      const messageText = `💬 InkWell: ${coachName || 'Your coach'} replied to your journal entry! Log in to read their message.`;
-
-      const message = await client.messages.create({
-        body: messageText,
-        from: TWILIO_PHONE_NUMBER.value(),
-        to: phoneNumber
-      });
-
-      console.log('✅ Coach reply notification SMS sent:', message.sid);
-
-      return {
-        success: true,
-        messageSid: message.sid
-      };
-    } catch (error) {
-      console.error('❌ Failed to send coach reply notification SMS:', error);
-      throw new HttpsError('internal', `Failed to send SMS: ${error.message}`);
-    }
-  }
-);
-
-/**
- * Send generic SMS notification
- */
-exports.sendSMS = onCall(
-  { secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER] },
-  async (request) => {
-    if (!request.auth) {
-      throw new HttpsError('unauthenticated', 'User must be logged in');
-    }
-
-    const { phoneNumber, message } = request.data;
-
-    if (!phoneNumber || !message) {
-      throw new HttpsError('invalid-argument', 'Phone number and message are required');
-    }
-
-    try {
-      const twilio = require('twilio');
-      const client = twilio(
-        TWILIO_ACCOUNT_SID.value(),
-        TWILIO_AUTH_TOKEN.value()
-      );
-
-      const smsMessage = await client.messages.create({
-        body: message,
-        from: TWILIO_PHONE_NUMBER.value(),
-        to: phoneNumber
-      });
-
-      console.log('✅ SMS sent:', smsMessage.sid);
-
-      return {
-        success: true,
-        messageSid: smsMessage.sid,
-        status: smsMessage.status
-      };
-    } catch (error) {
-      console.error('❌ Failed to send SMS:', error);
-      throw new HttpsError('internal', `Failed to send SMS: ${error.message}`);
-    }
-  }
-);
+// Removed 2026-10-02 (Adam approved): sendWishMilestone, sendDailyPrompt, sendGratitudePrompt,
+// sendCoachReplyNotification and sendSMS were callable by any signed-in user and texted any number.
+// The scheduled jobs (scheduledDailyPrompts, the goal milestone scheduler, coach-reply trigger) send
+// these messages server-side to opted-in users only.
 
 // =============================================================================
 // SCHEDULED DAILY PROMPTS SYSTEM
