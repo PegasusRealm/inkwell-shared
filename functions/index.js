@@ -5798,19 +5798,20 @@ exports.sendTestSMS = onCall(
       throw new HttpsError('invalid-argument', 'Phone number is required');
     }
     if (!/^\+[1-9]\d{9,14}$/.test(String(phoneNumber))) {
-      throw new HttpsError('invalid-argument', 'Use the full number with country code, like +15551234567');
+      throw new HttpsError('invalid-argument', 'Check the number and country code.');
     }
 
-    // Limit: 3 test texts per user per 24 hours (abuse protection, 2026-10-02)
-    const testRef = admin.firestore().collection('users').doc(request.auth.uid);
+    // Limit: 3 test texts per user per 24 hours (abuse protection, 2026-10-02).
+    // Stored in a server-only collection (no client rules), so users can't reset it.
+    const testRef = admin.firestore().collection('smsTestLimits').doc(request.auth.uid);
     const allowed = await admin.firestore().runTransaction(async (tx) => {
       const snap = await tx.get(testRef);
-      const log = (snap.exists && snap.data().smsTestLog) || {};
+      const log = (snap.exists && snap.data()) || {};
       const now = Date.now();
       const windowStart = typeof log.windowStart === 'number' ? log.windowStart : 0;
       const count = (now - windowStart < 24 * 60 * 60 * 1000) ? (log.count || 0) : 0;
       if (count >= 3) return false;
-      tx.set(testRef, { smsTestLog: { windowStart: count === 0 ? now : windowStart, count: count + 1 } }, { merge: true });
+      tx.set(testRef, { windowStart: count === 0 ? now : windowStart, count: count + 1 });
       return true;
     });
     if (!allowed) {
