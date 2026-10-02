@@ -112,8 +112,10 @@ const ALLOWED_ORIGINS = [
   'http://localhost:5000',  // Firebase hosting emulator default
   'http://127.0.0.1:5002',
   'http://127.0.0.1:5000',
-  'https://inkwelljournal.io',      // Production domain
-  'https://www.inkwelljournal.io'   // Production domain with www
+  'https://inkwelljournal.io',      // Production domain (redirects to castaliajournal.com once switched)
+  'https://www.inkwelljournal.io',  // Production domain with www
+  'https://castaliajournal.com',    // Castalia (2026-10-01)
+  'https://www.castaliajournal.com'
 ];
 
 function setupHardenedCORS(req, res) {
@@ -2984,6 +2986,8 @@ exports.validateInvitation = onRequest(async (req, res) => {
   const allowedOrigins = [
     'https://inkwelljournal.io',
     'https://www.inkwelljournal.io',
+    'https://castaliajournal.com',
+    'https://www.castaliajournal.com',
     'http://localhost:5000',
     'http://127.0.0.1:5000'
   ];
@@ -3056,6 +3060,8 @@ exports.sendPractitionerInvitation = onRequest({ secrets: [SENDGRID_API_KEY] }, 
   const allowedOrigins = [
     'https://inkwelljournal.io',
     'https://www.inkwelljournal.io',
+    'https://castaliajournal.com',
+    'https://www.castaliajournal.com',
     'http://localhost:5000',
     'http://127.0.0.1:5000'
   ];
