@@ -71,10 +71,10 @@ async function createUserProfileIfNotExists(uid, email) {
       interactionsLimit: 0,
       extraInteractionsPurchased: 0,
       giftedBy: null,
-      // Default insight preferences for new users (opt-in by default)
+      // Insight emails are a Plus feature and start OFF; the user turns them on (privacy: Sophy reads entries only when asked)
       insightsPreferences: {
-        weeklyEnabled: true,
-        monthlyEnabled: true,
+        weeklyEnabled: false,
+        monthlyEnabled: false,
         createdAt: admin.firestore.FieldValue.serverTimestamp()
       },
       // Progressive onboarding state tracking
@@ -102,6 +102,14 @@ async function createUserProfileIfNotExists(uid, email) {
     return { created: true };
   }
   return { created: false };
+}
+
+// Plus access for scheduled Plus features (insight emails). Mirrors the other server gates:
+// paid tiers, plus alpha testers (Plus free for life).
+function hasPlusAccess(userData) {
+  const tier = userData?.subscriptionTier || 'free';
+  const isAlpha = userData?.special_code === 'alpha' || userData?.role === 'alpha' || (Array.isArray(userData?.roles) && userData.roles.includes('alpha'));
+  return ['plus', 'connect'].includes(tier) || isAlpha;
 }
 const cors = require("cors");
 const corsHandler = cors({ origin: true });
@@ -3746,7 +3754,7 @@ async function generateAndSendInsights(period, requestId) {
       ? userData.insightsPreferences?.weeklyEnabled 
       : userData.insightsPreferences?.monthlyEnabled;
       
-    if (!insightsEnabled || !userData.email) {
+    if (!insightsEnabled || !userData.email || !hasPlusAccess(userData)) {
       continue;
     }
     
@@ -4553,10 +4561,10 @@ async function processWeeklyInsights(requestId) {
     // Filter to users with weekly insights enabled
     const eligibleUsers = usersSnapshot.docs.filter(doc => {
       const data = doc.data();
-      return data.insightsPreferences?.weeklyEnabled === true;
+      return data.insightsPreferences?.weeklyEnabled === true && hasPlusAccess(data);
     });
     
-    console.log(`[${requestId}] Found ${eligibleUsers.length} users with weekly insights enabled (out of ${usersSnapshot.size} total)`);
+    console.log(`[${requestId}] Found ${eligibleUsers.length} Plus users with weekly insights enabled (out of ${usersSnapshot.size} total)`);
     
     const processedUsers = [];
     const errors = [];
@@ -5004,6 +5012,11 @@ async function ghostFreeMonthlyInsights(requestId) {
       // Check if monthly insights enabled
       if (!userData.insightsPreferences?.monthlyEnabled) {
         console.log(`[${requestId}] Skipping ${userId} - monthly insights not enabled`);
+        continue;
+      }
+
+      // Insight emails are Plus-only
+      if (!hasPlusAccess(userData)) {
         continue;
       }
       
@@ -6338,52 +6351,8 @@ exports.scheduledDailyPrompts = onSchedule({
             console.log(`✅ User ${userId} already journaled today, skipping journal prompt`);
             skippedCount++;
           } else {
-            // Generate prompt (80% generic, 20% personalized)
-            let promptText = '';
-            const usePersonalized = Math.random() < 0.2; // 20% chance
-            
-            if (usePersonalized && ANTHROPIC_API_KEY && ANTHROPIC_API_KEY.value()) {
-              try {
-                // Get recent entries for context
-                const recentEntries = await admin.firestore()
-                  .collection('journalEntries')
-                  .where('userId', '==', userId)
-                  .orderBy('createdAt', 'desc')
-                  .limit(3)
-                  .get();
-                
-                if (!recentEntries.empty) {
-                  const recentText = recentEntries.docs
-                    .map(doc => doc.data().text?.substring(0, 200))
-                    .filter(text => text && text.trim())
-                    .join(' ');
-                  
-                  // Only generate personalized prompt if we have actual text
-                  if (recentText.trim()) {
-                    // Generate personalized prompt
-                    const aiResponse = await callAnthropicWithRetry({
-                      model: MODELS.FAST,
-        role: 'FAST',
-                      max_tokens: 150,
-                      messages: [{
-                        role: "user",
-                        content: `You are Sophy, a warm and encouraging journaling companion. Based on these recent journal entries: "${recentText}", create a thoughtful follow-up journaling prompt (max 100 characters). Be curious and supportive. Respond with ONLY the prompt question, no explanations or apologies.`
-                      }]
-                    }, "dailyPromptPersonalized", generateRequestId());
-                    
-                    promptText = aiResponse.content[0].text.trim().substring(0, 120);
-                  }
-                }
-              } catch (error) {
-                console.error('Failed to generate personalized prompt, using generic:', error);
-                promptText = ''; // Will fallback to generic
-              }
-            }
-            
-            // Use generic if personalized failed or wasn't selected
-            if (!promptText) {
-              promptText = GENERIC_PROMPTS[Math.floor(Math.random() * GENERIC_PROMPTS.length)];
-            }
+            // Generic prompts only. Reminders never read entries (privacy: Sophy reads entries only when asked).
+            const promptText = GENERIC_PROMPTS[Math.floor(Math.random() * GENERIC_PROMPTS.length)];
             
             // Send journal prompt via SMS (if enabled)
             if (wantsSmsJournal) {
@@ -7006,7 +6975,7 @@ exports.createCheckoutSession = onCall({
       // ═══════════════════════════════════════════════════════════════════════════
       // Alpha testers: 180 days FREE Connect, then lifetime discount applies
       // Beta testers: 120 days FREE Connect, then lifetime discount applies  
-      // Regular users: 7-day trial on Plus only (not Connect)
+      // Regular users: no trial (the 7-day Plus trial was turned off 2026-10-02)
       // ═══════════════════════════════════════════════════════════════════════════
       
       if (specialCode === 'alpha') {
@@ -7015,11 +6984,8 @@ exports.createCheckoutSession = onCall({
       } else if (specialCode === 'beta') {
         sessionConfig.subscription_data.trial_period_days = 120;
         console.log('🎁 Beta tester: 120 days FREE trial (4 months)');
-      } else if (tierName === 'plus' || tierName === 'plus_annual') {
-        // Regular users get 7-day trial on Plus only
-        sessionConfig.subscription_data.trial_period_days = 7;
-        console.log('🎁 Added 7-day free trial for Plus subscription');
       }
+      // Regular users: no free trial (turned off 2026-10-02 with the founding-rate note)
     }
     
     console.log('🔷 Session config:', JSON.stringify(sessionConfig, null, 2));
