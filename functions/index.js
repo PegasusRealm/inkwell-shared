@@ -3228,7 +3228,7 @@ exports.sendPractitionerInquiryNotification = onRequest(
       const sgMail = require('@sendgrid/mail');
       sgMail.setApiKey(SENDGRID_API_KEY.value());
 
-      const adminDashboardUrl = 'https://inkwelljournal.io/admin.html';
+      const adminDashboardUrl = 'https://inkwelljournal.io/admin-enhanced.html';
 
       const emailContent = {
         to: 'support@inkwelljournal.io',
@@ -3436,7 +3436,7 @@ exports.notifyAdminOfPractitionerRegistration = onDocumentCreated(
             ` : ''}
             
             <div style="text-align: center; margin: 30px 0;">
-              <a href="https://inkwelljournal.io/admin.html" 
+              <a href="https://inkwelljournal.io/admin-enhanced.html" 
                  style="background: #2A6972; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">
                 🔍 Review & Approve Registration
               </a>
@@ -3529,7 +3529,7 @@ exports.notifyAdminOfPractitionerRegistration = onDocumentCreated({
           ` : ''}
           
           <div style="text-align: center; margin: 30px 0;">
-            <a href="https://inkwelljournal.io/admin.html" 
+            <a href="https://inkwelljournal.io/admin-enhanced.html" 
                style="background: #2A6972; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">
               🔍 Review & Approve Registration
             </a>
@@ -5502,144 +5502,6 @@ async function updateUserBehavioralSummary(userId, newBehavior) {
 
 // Simple admin migration endpoint - bypasses client auth issues
 // Enabled for pre-TestFlight data standardization
-exports.runAdminMigration = onRequest({
-  cors: true
-}, async (req, res) => {
-  // Simple secret key check instead of Firebase auth
-  const adminKey = req.body.adminKey || req.query.adminKey;
-  if (adminKey !== "migrate-users-2024-beta") {
-    res.status(403).json({ error: "Invalid admin key" });
-    return;
-  }
-
-  try {
-    console.log("🔄 Starting admin user migration...");
-    
-    const usersRef = admin.firestore().collection("users");
-    const snapshot = await usersRef.get();
-    
-    let migrated = 0;
-    let skipped = 0;
-    let errors = 0;
-    const results = [];
-    
-    for (const doc of snapshot.docs) {
-      try {
-        const userData = doc.data();
-        const userId = doc.id;
-        
-        // Check if user needs migration (missing new fields OR has photoURL that needs conversion)
-        const needsMigration = 
-          !userData.userId || 
-          !userData.createdAt || 
-          userData.special_code === undefined ||
-          !userData.insightsPreferences ||
-          !userData.onboardingState ||
-          (userData.photoURL !== undefined && userData.avatar === undefined); // photoURL -> avatar conversion
-        
-        if (!needsMigration) {
-          skipped++;
-          results.push({ userId, status: "skipped", reason: "Already migrated" });
-          continue;
-        }
-        
-        console.log(`Migrating user: ${userId}`);
-        
-        // Prepare migration data
-        const migrationData = {};
-        
-        if (!userData.userId) {
-          migrationData.userId = userId;
-        }
-        
-        if (!userData.createdAt) {
-          migrationData.createdAt = admin.firestore.FieldValue.serverTimestamp();
-        }
-        
-        if (userData.special_code === undefined) {
-          migrationData.special_code = "beta";
-        }
-        
-        // Convert photoURL to avatar if needed
-        if (userData.photoURL !== undefined && userData.avatar === undefined) {
-          migrationData.avatar = userData.photoURL || "";
-          // Note: We'll keep photoURL for now but avatar is the canonical field
-        }
-        
-        // Ensure avatar field exists
-        if (userData.avatar === undefined && userData.photoURL === undefined) {
-          migrationData.avatar = "";
-        }
-        
-        if (!userData.insightsPreferences) {
-          migrationData.insightsPreferences = {
-            weeklyEnabled: true,
-            monthlyEnabled: true,
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-          };
-        }
-        
-        if (!userData.onboardingState) {
-          migrationData.onboardingState = {
-            hasCompletedVoiceEntry: false,
-            hasSeenWishTab: false,
-            hasCreatedWish: false,
-            hasUsedSophy: false,
-            totalEntries: 0,
-            currentMilestone: "existing_user",
-            milestones: {
-              firstEntry: null,
-              firstVoiceEntry: null,
-              firstWish: null,
-              firstSophyChat: null,
-              migratedAt: admin.firestore.FieldValue.serverTimestamp()
-            },
-            createdAt: admin.firestore.FieldValue.serverTimestamp()
-          };
-        }
-        
-        // Apply migration
-        await doc.ref.update(migrationData);
-        
-        migrated++;
-        results.push({ 
-          userId, 
-          status: "migrated", 
-          fields: Object.keys(migrationData) 
-        });
-        
-      } catch (userError) {
-        console.error(`Error migrating user ${doc.id}:`, userError);
-        errors++;
-        results.push({ 
-          userId: doc.id, 
-          status: "error", 
-          error: userError.message 
-        });
-      }
-    }
-    
-    const summary = {
-      success: true,
-      totalUsers: snapshot.size,
-      migrated,
-      skipped,
-      errors,
-      results: results.slice(0, 20) // Limit results to prevent large responses
-    };
-    
-    console.log("✅ Migration completed:", summary);
-    res.json(summary);
-    
-  } catch (error) {
-    console.error("❌ Migration failed:", error);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      details: error.stack
-    });
-  }
-});
 
 // Delete User Data - Comprehensive account deletion function
 exports.deleteUserData = onRequest({ secrets: [SENDGRID_API_KEY] }, async (req, res) => {
@@ -8990,345 +8852,13 @@ exports.checkStripeConnectStatus = onCall(
 // ADMIN: UPGRADE ALL USERS TO PLUS (BETA TESTING)
 // =============================================================================
 
-/**
- * HTTP endpoint to upgrade all users to Plus tier
- * This is a one-time migration function for beta testing
- * 
- * Usage: curl -X POST https://us-central1-inkwell-alpha.cloudfunctions.net/upgradeAllUsersToPlus?key=ADMIN_SECRET
- */
-exports.upgradeAllUsersToPlus = onRequest({
-  cors: true,
-  timeoutSeconds: 540, // 9 minutes for large user bases
-}, async (req, res) => {
-  // Simple security check - require a secret key
-  const providedKey = req.query.key || req.body?.key;
-  const expectedKey = 'inkwell-beta-upgrade-2026'; // Simple key for this one-time operation
-  
-  if (providedKey !== expectedKey) {
-    res.status(403).json({ error: 'Invalid key' });
-    return;
-  }
-  
-  console.log('🚀 Starting bulk upgrade to Plus tier...');
-  
-  try {
-    const usersSnapshot = await admin.firestore().collection('users').get();
-    
-    if (usersSnapshot.empty) {
-      res.json({ success: true, message: 'No users found', count: 0 });
-      return;
-    }
-    
-    console.log(`Found ${usersSnapshot.size} users to upgrade`);
-    
-    let successCount = 0;
-    let errorCount = 0;
-    const errors = [];
-    
-    // Process in batches of 500 (Firestore batch limit)
-    const batchSize = 500;
-    let batch = admin.firestore().batch();
-    let batchCount = 0;
-    
-    for (const userDoc of usersSnapshot.docs) {
-      const userRef = admin.firestore().collection('users').doc(userDoc.id);
-      
-      batch.update(userRef, {
-        subscriptionTier: 'plus',
-        subscriptionStatus: 'active',
-        'betaProgress.tierOverride': {
-          tier: 'plus',
-          setAt: admin.firestore.FieldValue.serverTimestamp(),
-          setBy: 'admin-migration-api'
-        }
-      });
-      
-      batchCount++;
-      
-      // Commit batch when it reaches the limit
-      if (batchCount >= batchSize) {
-        try {
-          await batch.commit();
-          successCount += batchCount;
-          console.log(`✅ Committed batch of ${batchCount} users (total: ${successCount})`);
-        } catch (batchError) {
-          errorCount += batchCount;
-          errors.push(`Batch failed: ${batchError.message}`);
-          console.error(`❌ Batch failed:`, batchError);
-        }
-        
-        // Reset batch
-        batch = admin.firestore().batch();
-        batchCount = 0;
-      }
-    }
-    
-    // Commit remaining users
-    if (batchCount > 0) {
-      try {
-        await batch.commit();
-        successCount += batchCount;
-        console.log(`✅ Committed final batch of ${batchCount} users`);
-      } catch (batchError) {
-        errorCount += batchCount;
-        errors.push(`Final batch failed: ${batchError.message}`);
-        console.error(`❌ Final batch failed:`, batchError);
-      }
-    }
-    
-    const result = {
-      success: true,
-      message: 'Bulk upgrade complete',
-      totalUsers: usersSnapshot.size,
-      successCount,
-      errorCount,
-      errors: errors.length > 0 ? errors : undefined
-    };
-    
-    console.log('✅ Migration complete:', result);
-    res.json(result);
-    
-  } catch (error) {
-    console.error('❌ Migration failed:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
 // =============================================================================
 // ADMIN: UPGRADE ALL USERS TO CONNECT (FINAL BETA PHASE)
 // =============================================================================
 
-/**
- * HTTP endpoint to upgrade all users to Connect tier
- * This is for the final beta testing phase - unlocks coach access
- * 
- * Usage: curl -X POST https://us-central1-inkwell-alpha.cloudfunctions.net/upgradeAllUsersToConnect?key=ADMIN_SECRET
- */
-exports.upgradeAllUsersToConnect = onRequest({
-  cors: true,
-  timeoutSeconds: 540, // 9 minutes for large user bases
-}, async (req, res) => {
-  // Simple security check - require a secret key
-  const providedKey = req.query.key || req.body?.key;
-  const expectedKey = 'inkwell-beta-connect-2026'; // Key for Connect upgrade
-  
-  if (providedKey !== expectedKey) {
-    res.status(403).json({ error: 'Invalid key' });
-    return;
-  }
-  
-  console.log('🚀 Starting bulk upgrade to Connect tier (final beta phase)...');
-  
-  try {
-    const usersSnapshot = await admin.firestore().collection('users').get();
-    
-    if (usersSnapshot.empty) {
-      res.json({ success: true, message: 'No users found', count: 0 });
-      return;
-    }
-    
-    console.log(`Found ${usersSnapshot.size} users to upgrade to Connect`);
-    
-    let successCount = 0;
-    let errorCount = 0;
-    const errors = [];
-    
-    // Process in batches of 500 (Firestore batch limit)
-    const batchSize = 500;
-    let batch = admin.firestore().batch();
-    let batchCount = 0;
-    
-    for (const userDoc of usersSnapshot.docs) {
-      const userRef = admin.firestore().collection('users').doc(userDoc.id);
-      
-      batch.update(userRef, {
-        subscriptionTier: 'connect',
-        subscriptionStatus: 'active',
-        'betaProgress.tierOverride': {
-          tier: 'connect',
-          setAt: admin.firestore.FieldValue.serverTimestamp(),
-          setBy: 'admin-connect-migration-api'
-        }
-      });
-      
-      batchCount++;
-      
-      // Commit batch when it reaches the limit
-      if (batchCount >= batchSize) {
-        try {
-          await batch.commit();
-          successCount += batchCount;
-          console.log(`✅ Committed batch of ${batchCount} users to Connect (total: ${successCount})`);
-        } catch (batchError) {
-          errorCount += batchCount;
-          errors.push(`Batch failed: ${batchError.message}`);
-          console.error(`❌ Batch failed:`, batchError);
-        }
-        
-        // Reset batch
-        batch = admin.firestore().batch();
-        batchCount = 0;
-      }
-    }
-    
-    // Commit remaining users
-    if (batchCount > 0) {
-      try {
-        await batch.commit();
-        successCount += batchCount;
-        console.log(`✅ Committed final batch of ${batchCount} users to Connect`);
-      } catch (batchError) {
-        errorCount += batchCount;
-        errors.push(`Final batch failed: ${batchError.message}`);
-        console.error(`❌ Final batch failed:`, batchError);
-      }
-    }
-    
-    const result = {
-      success: true,
-      message: 'Bulk upgrade to Connect complete - coach access unlocked!',
-      totalUsers: usersSnapshot.size,
-      successCount,
-      errorCount,
-      errors: errors.length > 0 ? errors : undefined
-    };
-    
-    console.log('✅ Connect migration complete:', result);
-    res.json(result);
-    
-  } catch (error) {
-    console.error('❌ Connect migration failed:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
-
 // =============================================================================
 // ADMIN: ASSIGN ALL USERS TO COACH HOLLIS VERDANT (BETA TESTING)
 // =============================================================================
-
-/**
- * HTTP endpoint to assign all users to coach Hollis Verdant
- * This is for beta testing - gives everyone access to coach features
- * 
- * Usage: curl -X POST "https://us-central1-inkwell-alpha.cloudfunctions.net/assignAllUsersToHollis?key=ADMIN_SECRET"
- */
-exports.assignAllUsersToHollis = onRequest({
-  cors: true,
-  timeoutSeconds: 540, // 9 minutes for large user bases
-}, async (req, res) => {
-  // Simple security check - require a secret key
-  const providedKey = req.query.key || req.body?.key;
-  const expectedKey = 'inkwell-beta-hollis-2026'; // Key for Hollis assignment
-  
-  if (providedKey !== expectedKey) {
-    res.status(403).json({ error: 'Invalid key' });
-    return;
-  }
-  
-  console.log('🎯 Starting bulk assignment to coach Hollis Verdant...');
-  
-  try {
-    const usersSnapshot = await admin.firestore().collection('users').get();
-    
-    if (usersSnapshot.empty) {
-      res.json({ success: true, message: 'No users found', count: 0 });
-      return;
-    }
-    
-    console.log(`Found ${usersSnapshot.size} users to assign to Hollis Verdant`);
-    
-    let successCount = 0;
-    let errorCount = 0;
-    let alreadyConnectedCount = 0;
-    const errors = [];
-    
-    // Process in batches of 500 (Firestore batch limit)
-    const batchSize = 500;
-    let batch = admin.firestore().batch();
-    let batchCount = 0;
-    
-    for (const userDoc of usersSnapshot.docs) {
-      const userData = userDoc.data();
-      
-      // Skip if already connected to a practitioner (optional - remove if you want to overwrite)
-      // if (userData.connectedPractitioner) {
-      //   alreadyConnectedCount++;
-      //   continue;
-      // }
-      
-      const userRef = admin.firestore().collection('users').doc(userDoc.id);
-      
-      batch.update(userRef, {
-        connectedPractitioner: {
-          email: 'coach@inkwelljournal.io',
-          name: 'Hollis Verdant',
-          practitionerId: 'ZiNM7YK1jnRgIkAKiCaO1lC6DGx2',
-          connectedAt: admin.firestore.FieldValue.serverTimestamp(),
-          connectionType: 'beta_assignment'
-        },
-        practitioners: admin.firestore.FieldValue.arrayUnion('ZiNM7YK1jnRgIkAKiCaO1lC6DGx2')
-      });
-      
-      batchCount++;
-      
-      // Commit batch when it reaches the limit
-      if (batchCount >= batchSize) {
-        try {
-          await batch.commit();
-          successCount += batchCount;
-          console.log(`✅ Committed batch of ${batchCount} users to Hollis (total: ${successCount})`);
-        } catch (batchError) {
-          errorCount += batchCount;
-          errors.push(`Batch failed: ${batchError.message}`);
-          console.error(`❌ Batch failed:`, batchError);
-        }
-        
-        // Reset batch
-        batch = admin.firestore().batch();
-        batchCount = 0;
-      }
-    }
-    
-    // Commit remaining users
-    if (batchCount > 0) {
-      try {
-        await batch.commit();
-        successCount += batchCount;
-        console.log(`✅ Committed final batch of ${batchCount} users to Hollis`);
-      } catch (batchError) {
-        errorCount += batchCount;
-        errors.push(`Final batch failed: ${batchError.message}`);
-        console.error(`❌ Final batch failed:`, batchError);
-      }
-    }
-    
-    const result = {
-      success: true,
-      message: 'All users assigned to coach Hollis Verdant!',
-      totalUsers: usersSnapshot.size,
-      successCount,
-      errorCount,
-      alreadyConnectedCount,
-      errors: errors.length > 0 ? errors : undefined
-    };
-    
-    console.log('✅ Hollis assignment complete:', result);
-    res.json(result);
-    
-  } catch (error) {
-    console.error('❌ Hollis assignment failed:', error);
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
-    });
-  }
-});
 
 /**
  * Monthly Insurance Expiration Check
@@ -9960,312 +9490,302 @@ exports.scheduledWishMilestones = onSchedule({
   console.log(`🎯 WISH Milestones complete: ${pushSentCount} push, ${smsSentCount} SMS sent, ${skippedCount} skipped (no prefs), ${noWishCount} no active WISH`);
 });
 
-/**
- * Set Hollis Verdant as a coach
- * One-time utility to ensure Hollis has userRole: 'coach'
- */
-exports.setHollisAsCoach = onRequest({
-  region: 'us-central1',
-  cors: true,
-}, async (req, res) => {
-  try {
-    const { secretKey } = req.body?.data || req.body || {};
-    
-    if (secretKey !== 'inkwell-beta-hollis-2026') {
-      return res.status(403).json({ success: false, error: 'Invalid secret key' });
-    }
-    
-    const hollisUid = 'ZiNM7YK1jnRgIkAKiCaO1lC6DGx2';
-    
-    // Get current Hollis data
-    const hollisDoc = await admin.firestore().collection('users').doc(hollisUid).get();
-    
-    if (!hollisDoc.exists) {
-      return res.status(404).json({ success: false, error: 'Hollis user not found' });
-    }
-    
-    const currentData = hollisDoc.data();
-    
-    // Update to set coach role AND freeAgentOptIn
-    await admin.firestore().collection('users').doc(hollisUid).update({
-      userRole: 'coach',
-      isPractitioner: true,
-      practitionerVerified: true,
-      accountType: 'coach',
-      freeAgentOptIn: true,
-      acceptingClients: 'yes'
-    });
-    
-    res.json({
-      success: true,
-      message: 'Hollis Verdant is now set as a public coach',
-      previousData: {
-        email: currentData.email,
-        displayName: currentData.displayName,
-        userRole: currentData.userRole,
-        isPractitioner: currentData.isPractitioner,
-        practitionerVerified: currentData.practitionerVerified,
-        freeAgentOptIn: currentData.freeAgentOptIn
-      }
-    });
-    
-  } catch (error) {
-    console.error('❌ Error setting Hollis as coach:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
+// ===== Pass B (2026-07-11): admin billing control — appended per approval =====
+const ADMIN_BILLING_PRICES = {
+  plus_monthly: 'price_1SeQaJIu1E0bDEgZq6V8lATE',
+  plus_annual:  'price_1ToXwuIu1E0bDEgZRe1elpOv',
+};
 
-/**
- * Set any user as a public coach by email
- * Utility function to set freeAgentOptIn for any coach
- */
-exports.setCoachPublic = onRequest({
-  region: 'us-central1',
-  cors: true,
-}, async (req, res) => {
-  try {
-    const { secretKey, email } = req.body?.data || req.body || {};
-    
-    if (secretKey !== 'inkwell-beta-admin-2026') {
-      return res.status(403).json({ success: false, error: 'Invalid secret key' });
-    }
-    
-    if (!email) {
-      return res.status(400).json({ success: false, error: 'Email required' });
-    }
-    
-    // Find user by email
-    const usersRef = admin.firestore().collection('users');
-    const snapshot = await usersRef.where('email', '==', email).get();
-    
-    if (snapshot.empty) {
-      return res.status(404).json({ success: false, error: 'User not found with that email' });
-    }
-    
-    const userDoc = snapshot.docs[0];
-    const currentData = userDoc.data();
-    
-    // Update to set coach role AND freeAgentOptIn
-    await userDoc.ref.update({
-      userRole: 'coach',
-      isPractitioner: true,
-      practitionerVerified: true,
-      freeAgentOptIn: true,
-      acceptingClients: 'yes'
-    });
-    
-    res.json({
-      success: true,
-      message: `${currentData.displayName || email} is now a public coach`,
-      uid: userDoc.id,
-      previousData: {
-        email: currentData.email,
-        displayName: currentData.displayName,
-        userRole: currentData.userRole,
-        freeAgentOptIn: currentData.freeAgentOptIn
-      }
-    });
-    
-  } catch (error) {
-    console.error('❌ Error setting coach public:', error);
-    res.status(500).json({ success: false, error: error.message });
+exports.adminBilling = onCall({ secrets: [STRIPE_SECRET_KEY], cors: true }, async (request) => {
+  // --- admin gate (identical to testInsightsForUser) ---
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Must be authenticated');
+  const adminDoc = await admin.firestore().collection('users').doc(request.auth.uid).get();
+  if (!adminDoc.exists || adminDoc.data().userRole !== 'admin') {
+    throw new HttpsError('permission-denied', 'Must be admin');
   }
-});
+  const adminEmail = adminDoc.data().email || request.auth.uid;
 
-/**
- * Fix admin account and get coach profiles
- * One-time utility to restore tfershi@pm.me to admin and capture coach data
- */
-exports.fixAdminGetCoaches = onRequest({
-  region: 'us-central1',
-  cors: true,
-}, async (req, res) => {
-  try {
-    const { secretKey, action } = req.body?.data || req.body || {};
-    
-    if (secretKey !== 'inkwell-beta-admin-2026') {
-      return res.status(403).json({ success: false, error: 'Invalid secret key' });
-    }
-    
-    const db = admin.firestore();
-    const result = {};
-    
-    // Get coach profiles
-    const coach1Doc = await db.collection('users').doc('ZiNM7YK1jnRgIkAKiCaO1lC6DGx2').get();
-    const coach2Doc = await db.collection('users').doc('14QhSBZSxyOmk0bdWvuCNPQnRgZ2').get();
-    
-    result.coaches = {
-      hollisVerdant: coach1Doc.exists ? coach1Doc.data() : null,
-      adamGrimm: coach2Doc.exists ? coach2Doc.data() : null
-    };
-    
-    // Fix admin account if action is 'fix'
-    if (action === 'fix') {
-      await db.collection('users').doc('4FeEdZPE5AOM7jQpii3y4LYnC3I2').update({
-        userRole: 'admin',
-        freeAgentOptIn: admin.firestore.FieldValue.delete(),
-        isPractitioner: admin.firestore.FieldValue.delete(),
-        practitionerVerified: admin.firestore.FieldValue.delete()
+  const { action, targetUid } = request.data || {};
+  if (!action || !targetUid) throw new HttpsError('invalid-argument', 'action and targetUid required');
+
+  const userRef = admin.firestore().collection('users').doc(targetUid);
+  const userSnap = await userRef.get();
+  if (!userSnap.exists) throw new HttpsError('not-found', 'Target user not found');
+  const user = userSnap.data();
+  const subId = user.stripeSubscriptionId;
+
+  const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+
+  // audit helper — every action lands in adminReports/adminActions
+  const audit = async (summary, before, after) => {
+    await admin.firestore().collection('adminReports').doc('adminActions')
+      .collection('log').add({
+        at: admin.firestore.FieldValue.serverTimestamp(),
+        adminUid: request.auth.uid, adminEmail,
+        targetUid, targetEmail: user.email || null,
+        action, summary, before: before || null, after: after || null,
       });
-      result.adminFixed = true;
-      result.message = 'Admin account (tfershi@pm.me) restored to userRole=admin, coach fields removed';
-    } else {
-      result.adminFixed = false;
-      result.message = 'Use action: "fix" to restore admin account';
+  };
+  const needSub = () => {
+    if (!subId) throw new HttpsError('failed-precondition',
+      'User has no Stripe subscription. Use the Firestore comp for manual (non-Stripe) grants.');
+    return subId;
+  };
+
+  try {
+    switch (action) {
+
+      // ---- change plan (monthly <-> annual) ----
+      case 'changePlan': {
+        needSub();
+        const target = request.data.plan; // 'plus_monthly' | 'plus_annual'
+        const newPrice = ADMIN_BILLING_PRICES[target];
+        if (!newPrice) throw new HttpsError('invalid-argument', 'plan must be plus_monthly or plus_annual');
+        const proration = request.data.proration === 'none' ? 'none' : 'create_prorations';
+        const sub = await stripe.subscriptions.retrieve(subId);
+        const itemId = sub.items.data[0].id;
+        const before = sub.items.data[0].price.id;
+        await stripe.subscriptions.update(subId, {
+          items: [{ id: itemId, price: newPrice }],
+          proration_behavior: proration,
+        });
+        // tier stays 'plus' both ways; webhook syncs status/periodEnd
+        await audit(`Changed plan → ${target} (proration: ${proration})`, before, newPrice);
+        return { ok: true, message: `Plan changed to ${target}.` };
+      }
+
+      // ---- cancel at period end (keeps access until renewal) ----
+      case 'cancelAtPeriodEnd': {
+        needSub();
+        await stripe.subscriptions.update(subId, { cancel_at_period_end: true });
+        await audit('Set cancel_at_period_end = true');
+        return { ok: true, message: 'Subscription will cancel at period end. Access continues until then.' };
+      }
+
+      // ---- reactivate (undo the above, before period end) ----
+      case 'reactivate': {
+        needSub();
+        await stripe.subscriptions.update(subId, { cancel_at_period_end: false });
+        await userRef.update({ subscriptionCancelAtPeriodEnd: false });
+        await audit('Reactivated (cancel_at_period_end = false)');
+        return { ok: true, message: 'Subscription reactivated.' };
+      }
+
+      // ---- cancel immediately (downgrades to free now) ----
+      case 'cancelNow': {
+        needSub();
+        await stripe.subscriptions.cancel(subId);
+        // webhook subscription.deleted downgrades tier to free; write is idempotent-safe here too
+        await audit('Canceled immediately');
+        return { ok: true, message: 'Subscription canceled now. Webhook will downgrade to free.' };
+      }
+
+      // ---- comp: 100% off forever on the live subscription ----
+      case 'comp': {
+        needSub();
+        const coupon = await stripe.coupons.create({
+          percent_off: 100, duration: 'forever',
+          name: `Admin comp by ${adminEmail}`,
+        });
+        await stripe.subscriptions.update(subId, { discount: { coupon: coupon.id } });
+        await audit('Applied 100%-off-forever comp coupon', null, coupon.id);
+        return { ok: true, message: 'Comp applied: 100% off forever on their Stripe subscription.' };
+      }
+
+      // ---- apply an existing coupon by ID (alpha 'Aa1ztUkB', beta 'oMb5nIdt', or custom) ----
+      case 'applyCoupon': {
+        needSub();
+        const couponId = request.data.couponId;
+        if (!couponId) throw new HttpsError('invalid-argument', 'couponId required');
+        await stripe.subscriptions.update(subId, { discount: { coupon: couponId } });
+        await audit(`Applied coupon ${couponId}`, null, couponId);
+        return { ok: true, message: `Coupon ${couponId} applied.` };
+      }
+
+      // ---- remove any current discount ----
+      case 'removeDiscount': {
+        needSub();
+        await stripe.subscriptions.update(subId, { discount: null });
+        await audit('Removed discount');
+        return { ok: true, message: 'Discount removed.' };
+      }
+
+      // ---- extend / grant trial (days from now) ----
+      case 'setTrial': {
+        needSub();
+        const days = parseInt(request.data.days, 10);
+        if (!days || days < 1 || days > 365) throw new HttpsError('invalid-argument', 'days must be 1-365');
+        const trialEnd = Math.floor(Date.now() / 1000) + days * 86400;
+        await stripe.subscriptions.update(subId, { trial_end: trialEnd, proration_behavior: 'none' });
+        await audit(`Set trial_end +${days}d`, null, new Date(trialEnd * 1000).toISOString());
+        return { ok: true, message: `Trial set to end in ${days} days.` };
+      }
+
+      default:
+        throw new HttpsError('invalid-argument', `Unknown action: ${action}`);
     }
-    
-    res.json({ success: true, ...result });
-    
-  } catch (error) {
-    console.error('❌ Error:', error);
-    res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    if (err instanceof HttpsError) throw err;
+    console.error('[adminBilling] Stripe error:', err.message);
+    throw new HttpsError('internal', err.message || 'Stripe operation failed');
   }
 });
 
-/**
- * Migrate user documents - clean up deprecated/duplicate fields
- * Preserves coach-specific fields for userRole === 'coach'
- */
-exports.migrateUserFields = onRequest({
-  region: 'us-central1',
-  cors: true,
-  timeoutSeconds: 540, // 9 minutes for large user base
-}, async (req, res) => {
+
+// ===== Pass C (2026-07-11): admin account rescue =====
+exports.adminAuth = onCall(async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Must be authenticated');
+  const adminDoc = await admin.firestore().collection('users').doc(request.auth.uid).get();
+  if (!adminDoc.exists || adminDoc.data().userRole !== 'admin') {
+    throw new HttpsError('permission-denied', 'Must be admin');
+  }
+  const adminEmail = adminDoc.data().email || request.auth.uid;
+
+  const { action, targetUid } = request.data || {};
+  if (!action || !targetUid) throw new HttpsError('invalid-argument', 'action and targetUid required');
+
+  const userRef = admin.firestore().collection('users').doc(targetUid);
+  const userSnap = await userRef.get();
+  if (!userSnap.exists) throw new HttpsError('not-found', 'Target user not found');
+  const user = userSnap.data();
+
+  const audit = async (summary, before, after) => {
+    await admin.firestore().collection('adminReports').doc('adminActions')
+      .collection('log').add({
+        at: admin.firestore.FieldValue.serverTimestamp(),
+        adminUid: request.auth.uid, adminEmail,
+        targetUid, targetEmail: user.email || null,
+        action, summary, before: before || null, after: after || null,
+      });
+  };
+
   try {
-    const { secretKey, dryRun = true, batchSize = 50 } = req.body?.data || req.body || {};
-    
-    if (secretKey !== 'inkwell-beta-admin-2026') {
-      return res.status(403).json({ success: false, error: 'Invalid secret key' });
+    switch (action) {
+
+      // Returns a password-reset LINK the admin can hand to the user directly
+      // (use when the emailed reset isn't reaching them).
+      case 'passwordResetLink': {
+        const email = user.email;
+        if (!email) throw new HttpsError('failed-precondition', 'User has no email on file');
+        const link = await admin.auth().generatePasswordResetLink(email);
+        await audit('Generated password-reset link');
+        return { ok: true, link, message: 'Reset link generated. Share it directly with the user.' };
+      }
+
+      // Returns an email-verification LINK to hand to the user.
+      case 'verifyLink': {
+        const email = user.email;
+        if (!email) throw new HttpsError('failed-precondition', 'User has no email on file');
+        const link = await admin.auth().generateEmailVerificationLink(email);
+        await audit('Generated email-verification link');
+        return { ok: true, link, message: 'Verification link generated.' };
+      }
+
+      // Change the account email (Auth + user doc kept in sync).
+      case 'changeEmail': {
+        const newEmail = (request.data.newEmail || '').trim();
+        if (!newEmail || !newEmail.includes('@')) throw new HttpsError('invalid-argument', 'Valid newEmail required');
+        const before = user.email || null;
+        await admin.auth().updateUser(targetUid, { email: newEmail });
+        await userRef.update({ email: newEmail, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+        await audit('Changed account email', before, newEmail);
+        return { ok: true, message: `Email changed to ${newEmail}.` };
+      }
+
+      // Disable (lock) the account — blocks sign-in without deleting anything.
+      case 'disable': {
+        await admin.auth().updateUser(targetUid, { disabled: true });
+        await audit('Disabled account (sign-in blocked)');
+        return { ok: true, message: 'Account disabled. The user can no longer sign in.' };
+      }
+
+      // Re-enable a disabled account.
+      case 'enable': {
+        await admin.auth().updateUser(targetUid, { disabled: false });
+        await audit('Enabled account');
+        return { ok: true, message: 'Account enabled.' };
+      }
+
+      default:
+        throw new HttpsError('invalid-argument', `Unknown action: ${action}`);
     }
-    
-    const db = admin.firestore();
-    const usersRef = db.collection('users');
-    const snapshot = await usersRef.get();
-    
-    // Fields to delete from ALL users (duplicates/deprecated)
-    const fieldsToDeleteAll = [
-      'signupUsername',           // Duplicate of displayName
-      'photoURL',                 // Legacy OAuth; use avatar
-      'lastLoginAt',              // Not actively used
-      'lastTokenUpdate',          // Not actively used
-      'accountType',              // Use userRole
-      'practitioners',            // Legacy array; use connectedPractitioner
-      'connectedCoach',           // Legacy alias
-    ];
-    
-    // Coach-specific fields to delete ONLY from non-coaches
-    const coachOnlyFields = [
-      'isPractitioner',
-      'practitionerVerified',
-      'freeAgentOptIn',
-      'bio',
-      'credentials',
-      'practiceLocation',
-      'specialties',
-      'acceptingClients',
-      'practitionerBio',
-      'practitionerCredentials',
-      'practitionerLocation',
-      'practitionerSpecialties',
-    ];
-    
-    const results = {
-      totalUsers: snapshot.size,
-      processed: 0,
-      updated: 0,
-      skipped: 0,
-      errors: [],
-      dryRun: dryRun,
-      fieldsRemoved: {}
+  } catch (err) {
+    if (err instanceof HttpsError) throw err;
+    console.error('[adminAuth] error:', err.message);
+    throw new HttpsError('internal', err.message || 'Auth operation failed');
+  }
+});
+
+
+// ===== Pass E (2026-07-11): ActiveCampaign bridge =====
+exports.adminLookupContact = onCall({ secrets: [AC_API_KEY] }, async (request) => {
+  if (!request.auth) throw new HttpsError('unauthenticated', 'Must be authenticated');
+  const adminDoc = await admin.firestore().collection('users').doc(request.auth.uid).get();
+  if (!adminDoc.exists || adminDoc.data().userRole !== 'admin') {
+    throw new HttpsError('permission-denied', 'Must be admin');
+  }
+
+  const email = (request.data.email || '').trim();
+  if (!email) throw new HttpsError('invalid-argument', 'email required');
+
+  const AC_URL = 'https://pegasusrealm.api-us1.com';
+  const headers = { 'Api-Token': AC_API_KEY.value(), 'Content-Type': 'application/json' };
+
+  try {
+    // 1) find the contact by email
+    const cRes = await fetch(`${AC_URL}/api/3/contacts?email=${encodeURIComponent(email)}`, { headers });
+    if (!cRes.ok) throw new HttpsError('internal', `AC contacts query failed (${cRes.status})`);
+    const cJson = await cRes.json();
+    const contact = (cJson.contacts || [])[0];
+
+    if (!contact) {
+      // Not in AC = removed (hard bounce cleanup), unsubscribed-and-purged, or never synced.
+      return { found: false, message: 'Not in ActiveCampaign — removed, hard-bounced, or never synced.' };
+    }
+
+    const contactId = contact.id;
+
+    // 2) tags (embedded fetch) + 3) list memberships (bounce/subscription state)
+    const [tagsRes, listsRes] = await Promise.all([
+      fetch(`${AC_URL}/api/3/contacts/${contactId}/contactTags`, { headers }),
+      fetch(`${AC_URL}/api/3/contacts/${contactId}/contactLists`, { headers }),
+    ]);
+    const tagsJson = tagsRes.ok ? await tagsRes.json() : {};
+    const listsJson = listsRes.ok ? await listsRes.json() : {};
+
+    // resolve tag ids -> names
+    let tags = [];
+    const contactTags = tagsJson.contactTags || [];
+    if (contactTags.length) {
+      const ids = contactTags.map(ct => ct.tag);
+      const tagLookups = await Promise.all(ids.map(id =>
+        fetch(`${AC_URL}/api/3/tags/${id}`, { headers }).then(r => r.ok ? r.json() : null).catch(() => null)
+      ));
+      tags = tagLookups.filter(Boolean).map(t => t.tag && t.tag.tag).filter(Boolean);
+    }
+
+    // AC contactList status: 1 = active/subscribed, 2 = unsubscribed (bounces land here)
+    const memberships = (listsJson.contactLists || []).map(l => ({
+      list: l.list, status: l.status,
+      label: l.status === '1' ? 'subscribed' : l.status === '2' ? 'unsubscribed/bounced' : `status ${l.status}`,
+    }));
+
+    return {
+      found: true,
+      contactId,
+      status: contact.status,                 // AC contact status
+      bounced: {
+        hard: contact.bounced_hard || '0',
+        soft: contact.bounced_soft || '0',
+        date: contact.bounced_date || null,
+      },
+      memberships,
+      tags,
+      updated: contact.udate || null,
     };
-    
-    const batch = db.batch();
-    let batchCount = 0;
-    
-    for (const doc of snapshot.docs) {
-      const data = doc.data();
-      const isCoach = data.userRole === 'coach';
-      const isAdmin = data.userRole === 'admin';
-      const updates = {};
-      const deletions = [];
-      
-      // Always delete deprecated fields
-      for (const field of fieldsToDeleteAll) {
-        if (data[field] !== undefined) {
-          updates[field] = admin.firestore.FieldValue.delete();
-          deletions.push(field);
-        }
-      }
-      
-      // Delete nested duplicates in smsPreferences
-      if (data.smsPreferences) {
-        if (data.smsPreferences.phoneNumber !== undefined) {
-          updates['smsPreferences.phoneNumber'] = admin.firestore.FieldValue.delete();
-          deletions.push('smsPreferences.phoneNumber');
-        }
-        if (data.smsPreferences.timezone !== undefined) {
-          updates['smsPreferences.timezone'] = admin.firestore.FieldValue.delete();
-          deletions.push('smsPreferences.timezone');
-        }
-        if (data.smsPreferences.gratitudePrompts !== undefined) {
-          updates['smsPreferences.gratitudePrompts'] = admin.firestore.FieldValue.delete();
-          deletions.push('smsPreferences.gratitudePrompts');
-        }
-      }
-      
-      // Delete betaProgress (deprecated)
-      if (data.betaProgress !== undefined) {
-        updates['betaProgress'] = admin.firestore.FieldValue.delete();
-        deletions.push('betaProgress');
-      }
-      
-      // Delete coach-only fields from non-coaches (but not admins who might test)
-      if (!isCoach && !isAdmin) {
-        for (const field of coachOnlyFields) {
-          if (data[field] !== undefined) {
-            updates[field] = admin.firestore.FieldValue.delete();
-            deletions.push(field);
-          }
-        }
-      }
-      
-      // If there are updates to make
-      if (Object.keys(updates).length > 0) {
-        if (!dryRun) {
-          batch.update(doc.ref, updates);
-          batchCount++;
-          
-          // Commit in batches to avoid memory issues
-          if (batchCount >= batchSize) {
-            await batch.commit();
-            batchCount = 0;
-          }
-        }
-        
-        results.updated++;
-        deletions.forEach(field => {
-          results.fieldsRemoved[field] = (results.fieldsRemoved[field] || 0) + 1;
-        });
-      } else {
-        results.skipped++;
-      }
-      
-      results.processed++;
-    }
-    
-    // Commit any remaining updates
-    if (!dryRun && batchCount > 0) {
-      await batch.commit();
-    }
-    
-    results.message = dryRun 
-      ? `DRY RUN: Would update ${results.updated} users, skip ${results.skipped} users`
-      : `COMPLETED: Updated ${results.updated} users, skipped ${results.skipped} users`;
-    
-    res.json({ success: true, ...results });
-    
-  } catch (error) {
-    console.error('❌ Migration error:', error);
-    res.status(500).json({ success: false, error: error.message });
+  } catch (err) {
+    if (err instanceof HttpsError) throw err;
+    console.error('[adminLookupContact] error:', err.message);
+    throw new HttpsError('internal', err.message || 'AC lookup failed');
   }
 });
