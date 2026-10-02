@@ -7761,11 +7761,17 @@ exports.scheduledAccountDeletion = onSchedule({
           .where('userId', '==', userId)
           .get();
         
-        const entryBatch = admin.firestore().batch();
+        // 2026-10-01: note every attachment path the entries point at before they go,
+        // and delete in chunks (a Firestore batch tops out at 500 writes).
+        const attachmentPaths = new Set();
         entriesSnapshot.docs.forEach(doc => {
-          entryBatch.delete(doc.ref);
+          (doc.data().attachments || []).forEach(a => { if (a && typeof a.path === 'string' && a.path) attachmentPaths.add(a.path); });
         });
-        await entryBatch.commit();
+        for (let i = 0; i < entriesSnapshot.docs.length; i += 450) {
+          const entryBatch = admin.firestore().batch();
+          entriesSnapshot.docs.slice(i, i + 450).forEach(doc => entryBatch.delete(doc.ref));
+          await entryBatch.commit();
+        }
         console.log(`  ✓ Deleted ${entriesSnapshot.size} journal entries`);
         
         // Delete user's manifest data
@@ -7791,17 +7797,30 @@ exports.scheduledAccountDeletion = onSchedule({
         await practitionerBatch.commit();
         console.log(`  ✓ Removed from ${practitionersSnapshot.size} practitioner connections`);
         
-        // Delete user's storage files (if any)
+        // Delete user's storage files (if any).
+        // 2026-10-01: files live in three places, and the old sweep only covered the first:
+        //   users/{uid}/...                  (legacy)
+        //   {uid}/...                        (phone app uploads)
+        //   attachments/{time}_{uid}_{name}  (web uploads via uploadFile)
+        // plus any path an entry recorded. The privacy promise is that all of it goes.
         try {
           const bucket = admin.storage().bucket();
-          const [files] = await bucket.getFiles({ prefix: `users/${userId}/` });
-          
-          if (files.length > 0) {
-            await Promise.all(files.map(file => file.delete()));
-            console.log(`  ✓ Deleted ${files.length} storage files`);
+          const toDelete = new Map();
+          for (const prefix of [`users/${userId}/`, `${userId}/`]) {
+            const [files] = await bucket.getFiles({ prefix });
+            files.forEach(f => toDelete.set(f.name, f));
           }
+          const [webFiles] = await bucket.getFiles({ prefix: 'attachments/' });
+          webFiles.filter(f => f.name.includes(`_${userId}_`)).forEach(f => toDelete.set(f.name, f));
+          attachmentPaths.forEach(p => { if (!toDelete.has(p)) toDelete.set(p, bucket.file(p)); });
+          const results = await Promise.allSettled([...toDelete.values()].map(f => f.delete()));
+          const failed = results.filter(r => r.status === 'rejected' && !(r.reason && r.reason.code === 404));
+          console.log(`  ✓ Deleted ${results.length - failed.length} storage files${failed.length ? `, ${failed.length} failed` : ''}`);
+          if (failed.length) throw new Error(`${failed.length} storage files could not be deleted`);
         } catch (storageError) {
-          console.warn(`  ⚠️ Storage deletion error (non-critical): ${storageError.message}`);
+          // Stop here and retry tomorrow rather than delete the account with files left behind.
+          console.error(`  ❌ Storage deletion error, account kept for retry: ${storageError.message}`);
+          throw storageError;
         }
         
         // Delete Firebase Auth account
