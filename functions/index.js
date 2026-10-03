@@ -5165,6 +5165,12 @@ exports.sendTestSMS = onCall(
       throw new HttpsError('unauthenticated', 'User must be logged in to send SMS');
     }
 
+    // Texts are part of Plus (2026-10-03, Adam)
+    const smsUserDoc = await admin.firestore().collection('users').doc(request.auth.uid).get();
+    if (!hasPlusAccess(smsUserDoc.data())) {
+      throw new HttpsError('permission-denied', 'Text messages are part of Castalia Plus.');
+    }
+
     const { phoneNumber } = request.data;
 
     if (!phoneNumber) {
@@ -5413,13 +5419,10 @@ exports.scheduledDailyPrompts = onSchedule({
       // Skip if user has neither channel set up
       if (!hasSmsSetup && !hasPushSetup) continue;
       
-      // SUBSCRIPTION CHECK: SMS is a Plus/Connect feature (web only)
-      // Push notifications are free for all users
-      // During beta testing, also allow 'beta' and 'alpha' special_code users for SMS
-      const tier = userData.subscriptionTier || 'free';
-      const specialCode = userData.special_code || '';
-      const isBetaTester = ['alpha', 'beta'].includes(specialCode);
-      const hasSmsAccess = hasSmsSetup && (['plus', 'connect'].includes(tier) || isBetaTester);
+      // SUBSCRIPTION CHECK: texts are a Plus feature (they cost money); push is free for all.
+      // 2026-10-03 (Adam): Plus only, via hasPlusAccess (alpha testers keep it). The old
+      // 'beta' pass is gone: 'beta' was stamped on ordinary phone sign-ups for months.
+      const hasSmsAccess = hasSmsSetup && hasPlusAccess(userData);
       // Push is free - just need token and enabled
       const hasPushAccess = hasPushSetup;
       
@@ -5686,6 +5689,11 @@ exports.scheduledWeeklyInsightsSMS = onSchedule({
       }
       
       if (!userData.smsPreferences?.weeklyInsights) {
+        continue;
+      }
+
+      // Texts are Plus only (2026-10-03, Adam)
+      if (!hasPlusAccess(userData)) {
         continue;
       }
       
@@ -8616,11 +8624,8 @@ exports.scheduledWishMilestones = onSchedule({
       const hasSmsSetup = userData.smsOptIn && userData.phoneNumber;
       const hasPushSetup = userData.fcmToken && userData.pushPreferences?.enabled;
       
-      // Check SMS access (Plus/Connect tier or beta tester)
-      const tier = userData.subscriptionTier || 'free';
-      const specialCode = userData.special_code || '';
-      const isBetaTester = ['alpha', 'beta'].includes(specialCode);
-      const hasSmsAccess = hasSmsSetup && (['plus', 'connect'].includes(tier) || isBetaTester);
+      // Texts are Plus only (2026-10-03, Adam); push milestones stay free.
+      const hasSmsAccess = hasSmsSetup && hasPlusAccess(userData);
       
       // Check if user wants WISH milestone notifications
       const wantsSms = hasSmsAccess && userData.smsPreferences?.wishMilestones !== false;
