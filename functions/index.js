@@ -42,7 +42,7 @@ const TWILIO_PHONE_NUMBER = defineSecret("TWILIO_PHONE_NUMBER");
 const STRIPE_SECRET_KEY = defineSecret("STRIPE_SECRET_KEY");
 const STRIPE_WEBHOOK_SECRET = defineSecret("STRIPE_WEBHOOK_SECRET");
 const REVENUECAT_WEBHOOK_AUTH = defineSecret("REVENUECAT_WEBHOOK_AUTH"); // 2026-10-03
-const REVENUECAT_SECRET_KEY = defineSecret("REVENUECAT_SECRET_KEY"); // 2026-10-03, RevenueCat secret API key (V1)
+const REVENUECAT_SECRET_KEY = defineSecret("REVENUECAT_SECRET_KEY"); // 2026-10-03, RevenueCat secret API key (V2: customer info + project config read)
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 
 // Simple Firebase Admin initialization - let it auto-detect credentials
@@ -6240,7 +6240,7 @@ exports.createBillingPortalSession = onCall({
 // The 10/01 Firestore rules stop the phone app from writing its own tier, so
 // App Store and Google Play purchases reach the server here instead.
 // RevenueCat's app_user_id is the Firebase uid (mobile_2 SubscriptionService
-// calls Purchases.logIn(uid)). On every event we ask RevenueCat for the
+// calls Purchases.logIn(uid)). On every event we ask RevenueCat (API v2) for the
 // customer's current state, as RevenueCat recommends, so event order,
 // refunds and transfers all come out right.
 // Setup: secrets REVENUECAT_WEBHOOK_AUTH and REVENUECAT_SECRET_KEY, and a
@@ -6250,34 +6250,59 @@ exports.createBillingPortalSession = onCall({
 // ═══════════════════════════════════════════════════════════════════════════
 const RC_TIER_RANK = { free: 0, plus: 1, connect: 2 };
 
-function rcEntitlementActive(ent, nowMs) {
-  if (!ent) return false;
-  if (!ent.expires_date) return true; // non-expiring purchase
-  const exp = Date.parse(ent.expires_date) || 0;
-  const grace = ent.grace_period_expires_date ? (Date.parse(ent.grace_period_expires_date) || 0) : 0;
-  return Math.max(exp, grace) > nowMs;
+// RevenueCat API v2 (2026-10-03): the project's V1 secret key was refused (401).
+// Key permissions needed: Customer information read, Project configuration read.
+const RC_PROJECT_ID = 'proj36fe27f3';
+const RC_API = `https://api.revenuecat.com/v2/projects/${RC_PROJECT_ID}`;
+let rcEntitlementKeys = null; // entitlement id -> lookup_key ('plus', 'connect'), cached per instance
+
+async function rcGet(path) {
+  const r = await fetch(`${RC_API}${path}`, {
+    headers: { Authorization: `Bearer ${(REVENUECAT_SECRET_KEY.value() || '').trim()}`, 'Content-Type': 'application/json' }
+  });
+  if (r.status === 404) return null;
+  if (!r.ok) {
+    const body = await r.text().catch(() => '');
+    throw new Error(`RevenueCat API ${r.status}${body ? ': ' + body.slice(0, 160) : ''}`);
+  }
+  return r.json();
+}
+
+async function rcEntitlementLookup() {
+  if (rcEntitlementKeys) return rcEntitlementKeys;
+  const data = await rcGet('/entitlements?limit=100');
+  const map = {};
+  ((data && data.items) || []).forEach(e => { map[e.id] = e.lookup_key; });
+  rcEntitlementKeys = map;
+  return map;
 }
 
 async function fetchRevenueCatState(uid) {
-  const r = await fetch(`https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(uid)}`, {
-    headers: { Authorization: `Bearer ${(REVENUECAT_SECRET_KEY.value() || '').trim()}`, 'Content-Type': 'application/json' }
-  });
-  if (!r.ok) throw new Error(`RevenueCat API ${r.status}`);
-  const sub = (await r.json()).subscriber || {};
-  const ents = sub.entitlements || {};
+  const cid = encodeURIComponent(uid);
+  const ents = await rcGet(`/customers/${cid}/active_entitlements?limit=100`);
+  if (!ents) return { tier: 'free', platform: null, willRenew: false, expiresAt: null }; // not a RevenueCat customer
+  const keys = await rcEntitlementLookup();
   const now = Date.now();
-  let tier = 'free';
-  let ent = null;
-  if (rcEntitlementActive(ents.connect, now)) { tier = 'connect'; ent = ents.connect; }
-  else if (rcEntitlementActive(ents.plus, now)) { tier = 'plus'; ent = ents.plus; }
+  const active = (ents.items || [])
+    .filter(e => !e.expires_at || e.expires_at > now)
+    .map(e => ({ key: keys[e.entitlement_id], expiresAt: e.expires_at || null }));
+  const ent = active.find(a => a.key === 'connect') || active.find(a => a.key === 'plus') || null;
+  const tier = ent ? ent.key : 'free';
   let platform = null;
   let willRenew = false;
-  let expiresAt = null;
+  const expiresAt = ent && ent.expiresAt ? new Date(ent.expiresAt) : null;
   if (ent) {
-    const s = (sub.subscriptions || {})[ent.product_identifier] || {};
-    platform = s.store === 'app_store' ? 'ios' : s.store === 'play_store' ? 'android' : (s.store || null);
-    willRenew = !!s.expires_date && !s.unsubscribe_detected_at && !s.refunded_at;
-    expiresAt = ent.expires_date ? new Date(ent.expires_date) : null;
+    // Store and renewal are nice to have; a failure here never blocks the tier.
+    try {
+      const subs = await rcGet(`/customers/${cid}/subscriptions?limit=100`);
+      const s = ((subs && subs.items) || []).find(x => x.gives_access);
+      if (s) {
+        platform = s.store === 'app_store' ? 'ios' : s.store === 'play_store' ? 'android' : (s.store || null);
+        willRenew = s.auto_renewal_status === 'will_renew';
+      }
+    } catch (e) {
+      console.warn(`RevenueCat subscriptions lookup failed for ${uid}: ${e.message}`);
+    }
   }
   return { tier, platform, willRenew, expiresAt };
 }
