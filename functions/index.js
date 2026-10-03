@@ -684,8 +684,12 @@ Output ONLY the letter body, starting with "Dear ${recipientName || '___'}," and
       }
       const email = decoded.email;
       if (!email) return res.status(400).json({ error: 'No email address on your account.' });
-      // Light abuse guard: 1 send per minute per user
-      const guardRef = admin.firestore().collection('users').doc(userId);
+      if (decoded.email_verified !== true) {
+        return res.status(403).json({ error: 'Confirm your email address first, then try again.' });
+      }
+      // Light abuse guard: 1 send per minute per user. Kept in a server-only
+      // collection (no client rules) so users can't reset it (2026-10-02).
+      const guardRef = admin.firestore().collection('rateLimits').doc(userId);
       const g = (await guardRef.get()).data() || {};
       const last = g.lastLetterEmailAt?.toMillis ? g.lastLetterEmailAt.toMillis() : 0;
       if (Date.now() - last < 60000) {
@@ -2275,212 +2279,7 @@ exports.logSearchQuery = onRequest(async (req, res) => {
 });
 
 // HTTP function with explicit CORS handling for coach replies
-exports.saveCoachReplyHTTP = onRequest({
-  cors: true,
-  secrets: [TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER]
-}, async (req, res) => {
-  try {
-    console.log("🔍 saveCoachReplyHTTP called with method:", req.method);
-    console.log("🔍 Headers:", req.headers);
-    console.log("🔍 Body:", req.body);
-
-    // Handle preflight OPTIONS request
-    if (req.method === 'OPTIONS') {
-      res.set('Access-Control-Allow-Origin', '*');
-      res.set('Access-Control-Allow-Methods', 'POST');
-      res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-      res.status(204).send('');
-      return;
-    }
-
-    // Only allow POST requests
-    if (req.method !== 'POST') {
-      res.status(405).json({ error: 'Method not allowed' });
-      return;
-    }
-
-    // Get the ID token from the Authorization header
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      console.error("❌ No authorization header found");
-      res.status(401).json({ error: 'Practitioner must be authenticated.' });
-      return;
-    }
-
-    const idToken = authHeader.split('Bearer ')[1];
-    console.log("🔑 ID token received:", idToken?.substring(0, 20) + "...");
-
-    // Verify the ID token
-    let decodedToken;
-    try {
-      decodedToken = await admin.auth().verifyIdToken(idToken);
-      console.log("✅ Token verified for user:", decodedToken.uid);
-    } catch (tokenError) {
-      console.error("❌ Token verification failed:", tokenError);
-      res.status(401).json({ error: 'Invalid authentication token.' });
-      return;
-    }
-
-    const coachUid = decodedToken.uid;
-
-    // Verify the user has coach role
-    try {
-      const userDoc = await admin.firestore().collection("users").doc(coachUid).get();
-      console.log("📋 User document exists:", userDoc.exists);
-      if (userDoc.exists) {
-        const userData = userDoc.data();
-        console.log("👤 User data:", {
-          userRole: userData?.userRole,
-          email: userData?.email
-        });
-      }
-      
-      if (!userDoc.exists || userDoc.data()?.userRole !== "coach") {
-        console.error("❌ User does not have coach role");
-        res.status(403).json({ error: 'User does not have practitioner permissions.' });
-        return;
-      }
-    } catch (roleError) {
-      console.error("❌ Error checking coach role:", roleError);
-      res.status(500).json({ error: 'Unable to verify practitioner permissions.' });
-      return;
-    }
-
-    console.log("✅ Coach role verified");
-
-    const { entryId, replyText } = req.body;
-    
-    if (!entryId || !replyText || typeof replyText !== "string") {
-      console.error("❌ Invalid data:", { entryId: !!entryId, replyText: !!replyText, replyTextType: typeof replyText });
-      res.status(400).json({ error: 'Entry ID and reply text are required.' });
-      return;
-    }
-
-    try {
-      const replyRef = admin.firestore()
-        .collection("journalEntries")
-        .doc(entryId)
-        .collection("coachReplies")
-        .doc(coachUid);
-
-      await replyRef.set({
-        replyText,
-        timestamp: admin.firestore.FieldValue.serverTimestamp(),
-        coachUid
-      });
-
-      await admin.firestore()
-        .collection("journalEntries")
-        .doc(entryId)
-        .update({ newCoachReply: true });
-
-      console.log("✅ Coach reply saved successfully");
-
-      // Send notifications to user (SMS + Push)
-      try {
-        // Get the journal entry to find the user
-        const entryDoc = await admin.firestore().collection("journalEntries").doc(entryId).get();
-        if (entryDoc.exists) {
-          const entryData = entryDoc.data();
-          const userId = entryData.userId;
-          
-          // Get user's preferences
-          const userDoc = await admin.firestore().collection("users").doc(userId).get();
-          if (userDoc.exists) {
-            const userData = userDoc.data();
-            
-            // Debug log user notification preferences
-            console.log("📱 User notification settings:", {
-              userId,
-              fcmToken: userData.fcmToken ? "present" : "missing",
-              pushEnabled: userData.pushPreferences?.enabled,
-              pushCoachReplies: userData.pushPreferences?.coachReplies,
-              smsOptIn: userData.smsOptIn,
-              phoneNumber: userData.phoneNumber ? "present" : "missing",
-              smsCoachReplies: userData.smsPreferences?.coachReplies
-            });
-            
-            // Get coach's name
-            const coachDoc = await admin.firestore().collection("users").doc(coachUid).get();
-            const coachName = coachDoc.exists ? coachDoc.data().displayName || 'Your coach' : 'Your coach';
-            
-            // Send FCM Push Notification if user has it enabled
-            const shouldSendPush = userData.fcmToken && userData.pushPreferences?.enabled && userData.pushPreferences?.coachReplies !== false;
-            console.log("📲 Push notification decision:", { shouldSendPush, hasFcmToken: !!userData.fcmToken, pushEnabled: userData.pushPreferences?.enabled, coachReplies: userData.pushPreferences?.coachReplies });
-            
-            if (shouldSendPush) {
-              try {
-                const pushSent = await sendPushNotification(
-                  userData.fcmToken,
-                  '💬 New Coach Reply',
-                  `${coachName} replied to your journal entry!`,
-                  {
-                    type: 'coach_reply',
-                    entryId: entryId,
-                    coachName: coachName,
-                  },
-                  { badge: 1 }  // Red dot for coach replies
-                );
-                if (pushSent) {
-                  console.log(`✅ Push notification sent to user ${userId} for coach reply`);
-                }
-              } catch (pushError) {
-                console.error("❌ Failed to send push notification (non-fatal):", pushError.message);
-              }
-            } else {
-              console.log("⏭️ Skipping push notification - conditions not met");
-            }
-            
-            // Send SMS if user has SMS enabled and wants coach reply notifications
-            // Default coachReplies to true if not explicitly set to false
-            const shouldSendSms = userData.smsOptIn && userData.phoneNumber && userData.smsPreferences?.coachReplies !== false;
-            console.log("📱 SMS notification decision:", { shouldSendSms });
-            
-            if (shouldSendSms) {
-              // Send SMS
-              const twilio = require('twilio');
-              const client = twilio(
-                TWILIO_ACCOUNT_SID.value(),
-                TWILIO_AUTH_TOKEN.value()
-              );
-              
-              const messageText = `💬 InkWell: ${coachName} replied to your journal entry! Log in to read their message.\n\nReply STOP to unsubscribe`;
-              
-              await client.messages.create({
-                body: messageText,
-                from: TWILIO_PHONE_NUMBER.value(),
-                to: userData.phoneNumber
-              });
-              
-              console.log(`✅ Practitioner reply SMS sent to user ${userId}`);
-            } else {
-              console.log("⏭️ Skipping SMS - conditions not met");
-            }
-          } else {
-            console.log("⚠️ User document not found for notifications:", userId);
-          }
-        } else {
-          console.log("⚠️ Journal entry not found for notifications:", entryId);
-        }
-      } catch (notifyError) {
-        // Don't fail the whole operation if notifications fail
-        console.error("❌ Failed to send notifications (non-fatal):", notifyError);
-      }
-
-      res.status(200).json({ success: true });
-    } catch (error) {
-      console.error("❌ Error saving coach reply:", error);
-      res.status(500).json({ 
-        error: 'Unable to save the coach reply right now. Please try again.',
-        code: 'SAVE_ERROR',
-        retryable: true 
-      });
-    }
-  } catch (error) {
-    console.error("❌ Unexpected error in saveCoachReplyHTTP:", error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
+// saveCoachReplyHTTP removed 2026-10-02 (Adam approved): coach features are retired.
 
 // Keep the original callable function as backup
 exports.saveCoachReply = onCall({
@@ -2606,244 +2405,7 @@ exports.markCoachRepliesAsRead = onCall({
 });
 
 
-exports.notifyCoachOfTaggedEntry = onRequest({ secrets: [SENDGRID_API_KEY] }, async (req, res) => {
-  const requestId = generateRequestId();
-  console.log(`[${requestId}] Coach notification request started`);
-  
-  // Apply hardened CORS
-  if (!setupHardenedCORS(req, res)) {
-    console.warn(`[${requestId}] Rejected request from unauthorized origin: ${req.headers.origin}`);
-    return res.status(403).send('Forbidden');
-  }
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(204).send('');
-  }
-
-  if (req.method !== 'POST') {
-    return sendSecureErrorResponse(res, 405, 'Method not allowed');
-  }
-
-  try {
-    // Verify authentication
-    const authHeader = req.headers.authorization;
-    let authenticatedUserId = null;
-    
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      console.warn(`[${requestId}] Missing or invalid authorization header`);
-      return sendSecureErrorResponse(res, 401, 'Authentication required');
-    }
-    
-    try {
-      const idToken = authHeader.split('Bearer ')[1];
-      const decodedToken = await admin.auth().verifyIdToken(idToken);
-      authenticatedUserId = decodedToken.uid;
-      console.log(`[${requestId}] User authenticated: ${authenticatedUserId}`);
-    } catch (authError) {
-      console.error(`[${requestId}] Authentication failed:`, authError.message);
-      return sendSecureErrorResponse(res, 401, 'Invalid authentication token');
-    }
-
-    // Validate SendGrid API key (more lenient for local development)
-    const apiKey = SENDGRID_API_KEY.value();
-    if (!apiKey) {
-      console.error(`[${requestId}] SendGrid API key is missing - this is expected in local development`);
-      
-      // In local development, simulate success for testing purposes
-      if (process.env.NODE_ENV !== 'production' && (req.headers.host?.includes('localhost') || req.headers.host?.includes('127.0.0.1'))) {
-        console.log(`[${requestId}] Local development mode - simulating successful email send`);
-        
-        const { entryId } = req.body || {};
-        if (entryId) {
-          // Still update the entry to mark as notified
-          await admin.firestore().collection("journalEntries").doc(entryId).update({
-            coachNotifiedAt: admin.firestore.FieldValue.serverTimestamp()
-          });
-        }
-        
-        return res.status(200).json({ message: "Coach notified successfully (simulated in local dev)" });
-      }
-      
-      return sendSecureErrorResponse(res, 500, 'Email service configuration error');
-    }
-    
-    if (!apiKey.startsWith("SG.")) {
-      console.error(`[${requestId}] SendGrid API key format is invalid`);
-      return sendSecureErrorResponse(res, 500, 'Email service configuration error');
-    }
-
-    sgMail.setApiKey(apiKey);
-    console.log(`[${requestId}] SendGrid API key configured`);
-
-    const { entryId, userId } = req.body || {};
-    console.log(`[${requestId}] Payload received:`, { entryId, userId });
-
-    if (!entryId) {
-      console.error(`[${requestId}] Missing entryId for journal entry notification`);
-      return sendSecureErrorResponse(res, 400, 'Missing entry ID');
-    }
-
-    // Verify user owns the entry or is authorized
-    if (userId && userId !== authenticatedUserId) {
-      console.warn(`[${requestId}] User ${authenticatedUserId} attempted to notify for entry owned by ${userId}`);
-      return sendSecureErrorResponse(res, 403, 'Not authorized to notify for this entry');
-    }
-
-    const timestampNote = `<p style="font-size:0.85em; color:#777;">This message was sent at: ${new Date().toLocaleString()}</p>`;
-
-    // Load the journal entry
-    const entryDoc = await admin.firestore().collection("journalEntries").doc(entryId).get();
-    if (!entryDoc.exists) {
-      console.error(`[${requestId}] Entry not found in Firestore for ID: ${entryId}`);
-      return sendSecureErrorResponse(res, 404, 'Entry not found');
-    }
-
-    const entry = entryDoc.data();
-    
-    // Verify the entry belongs to the authenticated user
-    if (entry.userId !== authenticatedUserId) {
-      console.warn(`[${requestId}] Entry ${entryId} belongs to ${entry.userId}, not ${authenticatedUserId}`);
-      return sendSecureErrorResponse(res, 403, 'Not authorized to notify for this entry');
-    }
-    
-    // Look up the user's connected practitioner
-    const userDoc = await admin.firestore().collection('users').doc(authenticatedUserId).get();
-    const userData = userDoc.data();
-    
-    let coachEmail = null;
-    let coachName = 'Coach';
-    
-    // Check for connectedPractitioner (new format)
-    if (userData?.connectedPractitioner?.email) {
-      coachEmail = userData.connectedPractitioner.email;
-      coachName = userData.connectedPractitioner.name || 'Coach';
-      console.log(`[${requestId}] Found connectedPractitioner: ${coachEmail}`);
-    } 
-    // Fallback: check legacy practitioners array
-    else if (userData?.practitioners && userData.practitioners.length > 0) {
-      const practitionerId = userData.practitioners[0];
-      const practDoc = await admin.firestore().collection('users').doc(practitionerId).get();
-      if (practDoc.exists) {
-        coachEmail = practDoc.data()?.email;
-        coachName = practDoc.data()?.displayName || 'Coach';
-        console.log(`[${requestId}] Found practitioner from array: ${coachEmail}`);
-      }
-    }
-    
-    if (!coachEmail) {
-      console.warn(`[${requestId}] No connected practitioner found for user ${authenticatedUserId}`);
-      return sendSecureErrorResponse(res, 400, 'No coach connected. Please connect to a coach in Settings first.');
-    }
-    
-    // Check throttling - don't send duplicate notifications
-    const lastNotified = entry?.coachNotifiedAt?.toDate?.();
-    if (lastNotified && Date.now() - lastNotified.getTime() < 10 * 60 * 1000) {
-      console.warn(`[${requestId}] Email already sent recently. Skipping notification.`);
-      return res.status(200).json({ message: "Already notified recently" });
-    }
-
-    const dateStr = entry.createdAt?.toDate?.().toLocaleString?.() || "Unknown date";
-    const manifest = entry.contextManifest || "";
-    const entryText = entry.text?.substring(0, 1000) || "(No content)";
-
-    const msg = {
-      to: coachEmail,
-      from: "support@inkwelljournal.io",
-      subject: "New Journal Entry Tagged for Coach Review",
-      text: `Hi,
-
-A new journal entry was tagged for your review on ${dateStr}.
-
-${manifest ? `Manifest: ${manifest}\n\n` : ""}Entry Preview:
-
-${entryText}
-
-Reply: https://inkwelljournal.io/coach.html?entryId=${entryId}
-
-– InkWell by Pegasus Realm`,
-      html: `
-        <p><strong>Hi,</strong></p>
-        <p>A new entry has been tagged for your review on <strong>${dateStr}</strong>.</p>
-        ${manifest ? `<p><strong>Manifest:</strong> ${manifest}</p>` : ""}
-        <p><strong>Journal Entry Preview:</strong></p>
-        <blockquote style="background:#f9f9f9;padding:1em;border-left:4px solid #FFA76D;">
-          ${(entryText || "").replace(/\n/g, "<br/>")}
-        </blockquote>
-        <p><a href="https://inkwelljournal.io/coach.html?entryId=${entryId}">Click here to reply</a></p>
-        ${timestampNote}
-        <hr/>
-        <p style="font-size:0.9em;color:#777;">
-          InkWell by Pegasus Realm • <a href="mailto:support@inkwelljournal.io">support@inkwelljournal.io</a>
-        </p>
-      `,
-    };
-
-    try {
-      await sgMail.send(msg);
-      console.log(`[${requestId}] Email sent successfully to: ${coachEmail}`);
-    } catch (sendError) {
-      console.error(`[${requestId}] SendGrid email failed:`, {
-        message: sendError.message,
-        code: sendError.code,
-        response: sendError.response?.body
-      });
-      
-      // Check if it's a billing/credits issue
-      const errorBody = sendError.response?.body;
-      const isCreditsIssue = errorBody && (
-        JSON.stringify(errorBody).includes('billing') ||
-        JSON.stringify(errorBody).includes('credit') ||
-        JSON.stringify(errorBody).includes('quota') ||
-        JSON.stringify(errorBody).includes('limit')
-      );
-      
-      if (isCreditsIssue) {
-        console.warn(`[${requestId}] SendGrid billing/credits issue - marking entry but not sending email`);
-        
-        // Still update the entry to prevent repeated attempts
-        await admin.firestore().collection("journalEntries").doc(entryId).update({
-          coachNotifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-          coachNotificationStatus: 'pending_billing_resolution'
-        });
-        
-        // Return success to user but log the issue
-        console.log(`[${requestId}] Coach notification marked as pending due to billing issue`);
-        return res.status(200).json({ 
-          message: "Entry saved successfully. Coach notification will be sent once service is restored.",
-          status: "pending"
-        });
-      }
-      
-      return sendSecureErrorResponse(res, 502, 'Email service temporarily unavailable', sendError);
-    }
-
-    // Update entry with notification timestamp
-    await admin.firestore().collection("journalEntries").doc(entryId).update({
-      coachNotifiedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    console.log(`[${requestId}] Coach notification completed successfully`);
-    return res.status(200).json({ message: "Coach notified successfully" });
-    
-  } catch (err) {
-    console.error(`[${requestId}] Coach notification failed:`, {
-      message: err.message,
-      stack: err.stack,
-      code: err.code
-    });
-    
-    // Return appropriate error based on error type
-    if (err.message.includes('auth')) {
-      return sendSecureErrorResponse(res, 401, 'Authentication failed', err);
-    } else if (err.message.includes('not found')) {
-      return sendSecureErrorResponse(res, 404, 'Entry not found', err);
-    } else if (err.message.includes('SendGrid') || err.message.includes('email')) {
-      return sendSecureErrorResponse(res, 502, 'Email service temporarily unavailable', err);
-    } else {
-      return sendSecureErrorResponse(res, 500, 'Failed to notify coach', err);
-    }
-  }
-});
+// notifyCoachOfTaggedEntry removed 2026-10-02 (Adam approved): coach features are retired; it emailed entries to a user-editable address.
 
 
 // Create user profile if not exists (callable)
@@ -3062,157 +2624,7 @@ exports.validateInvitation = onRequest(async (req, res) => {
 });
 
 // Send practitioner invitation email
-exports.sendPractitionerInvitation = onRequest({ secrets: [SENDGRID_API_KEY] }, async (req, res) => {
-  // Set CORS headers for both domains
-  const origin = req.headers.origin;
-  const allowedOrigins = [
-    'https://inkwelljournal.io',
-    'https://www.inkwelljournal.io',
-    'https://castaliajournal.com',
-    'https://www.castaliajournal.com',
-    'http://localhost:5000',
-    'http://127.0.0.1:5000'
-  ];
-  
-  if (allowedOrigins.includes(origin)) {
-    res.set('Access-Control-Allow-Origin', origin);
-  } else {
-    res.set('Access-Control-Allow-Origin', '*');
-  }
-  
-  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  
-  if (req.method === 'OPTIONS') {
-    return res.status(204).send('');
-  }
-
-  try {
-    // Verify authentication
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-
-    const idToken = authHeader.split('Bearer ')[1];
-    const decodedToken = await admin.auth().verifyIdToken(idToken);
-    const userId = decodedToken.uid;
-
-    // Get user info
-    const userDoc = await admin.firestore().collection("users").doc(userId).get();
-    if (!userDoc.exists) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    const userData = userDoc.data();
-    const userName = userData.signupUsername || userData.displayName || userData.email || 'InkWell User';
-
-    const apiKey = SENDGRID_API_KEY.value();
-    sgMail.setApiKey(apiKey);
-
-    const { practitionerEmail, practitionerName } = req.body;
-    
-    console.log('📧 Coach invitation request received:', { practitionerEmail, practitionerName, fromUser: userName });
-
-    // Create unique invitation token
-    const invitationToken = Math.random().toString(36).substring(2, 15) + 
-                           Math.random().toString(36).substring(2, 15);
-
-    const registrationUrl = `https://inkwelljournal.io/practitioner-register.html?token=${invitationToken}`;
-
-    const emailContent = {
-      to: practitionerEmail,
-      from: "support@inkwelljournal.io",
-      subject: `${userName} has invited you to InkWell - Wellness Journaling Platform`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
-          <div style="text-align: center; margin-bottom: 30px;">
-            <img src="https://inkwelljournal.io/InkWell-Logo.png" alt="InkWell" style="max-width: 200px;">
-          </div>
-          
-          <h2 style="color: #2A6972; text-align: center;">You've Been Invited to InkWell</h2>
-          
-          <p style="font-size: 16px; line-height: 1.6;">Hello ${practitionerName},</p>
-          
-          <p style="font-size: 16px; line-height: 1.6;">
-            <strong>${userName}</strong> (${userData.email}) has invited you to join InkWell as their coach. 
-            InkWell is a wellness journaling platform that connects clients with their coaches.
-          </p>
-          
-          <div style="background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; border-left: 4px solid #2A6972;">
-            <h3 style="margin-top: 0; color: #2A6972;">What is InkWell?</h3>
-            <ul style="margin: 10px 0;">
-              <li>Evidence-based journaling & manifesting platform for wellness and personal growth</li>
-              <li>Secure communication between clients and coaches</li>
-              <li>Custom built wellness and growth AI-assisted reflection tools (Sophy) to support clients</li>
-              <li>Built by wellness professionals for wellness professionals</li>
-            </ul>
-          </div>
-          
-          <p style="font-size: 16px; line-height: 1.6;">
-            To get started and connect with ${userName}, please complete your coach registration:
-          </p>
-          
-          <div style="text-align: center; margin: 30px 0;">
-            <a href="${registrationUrl}" 
-               style="background: #2A6972; color: white; padding: 15px 30px; text-decoration: none; border-radius: 5px; font-weight: bold; display: inline-block;">
-              Complete Registration
-            </a>
-          </div>
-          
-          <p style="font-size: 14px; color: #666; line-height: 1.5;">
-            This invitation will expire in 30 days. If you have any questions about InkWell or need support, 
-            please contact us at <a href="mailto:support@inkwelljournal.io">support@inkwelljournal.io</a>.
-          </p>
-          
-          <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
-          
-          <p style="font-size: 12px; color: #999; text-align: center;">
-            InkWell by Pegasus Realm LLC<br>
-            Wellness Journaling Platform<br>
-            <a href="https://www.inkwelljournal.io">inkwelljournal.io</a>
-          </p>
-        </div>
-      `
-    };
-
-    console.log('📤 Sending email via SendGrid to:', practitionerEmail);
-    
-    try {
-      await sgMail.send(emailContent);
-      console.log('✅ Coach invitation email sent successfully to:', practitionerEmail);
-    } catch (sendError) {
-      console.error('❌ SendGrid email failed:', sendError.message);
-      if (sendError.response) {
-        console.error('❌ SendGrid response body:', sendError.response.body);
-      }
-      throw sendError; // Re-throw to trigger error response
-    }
-    
-    // Calculate expiration date (30 days from now)
-    const expirationDate = new Date();
-    expirationDate.setDate(expirationDate.getDate() + 30);
-    
-    // Only save to Firestore AFTER email succeeds
-    await admin.firestore().collection("practitionerInvitations").doc(invitationToken).set({
-      fromUserId: userId,
-      fromUserName: userName,
-      fromUserEmail: userData.email,
-      practitionerEmail: practitionerEmail,
-      practitionerName: practitionerName,
-      status: 'pending',
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      expiresAt: expirationDate
-    });
-    console.log('💾 Invitation saved to Firestore with token:', invitationToken, 'expires:', expirationDate);
-
-    res.json({ success: true, message: 'Invitation sent successfully' });
-
-  } catch (error) {
-    console.error('❌ Error sending practitioner invitation:', error);
-    res.status(500).json({ error: 'Failed to send invitation: ' + error.message });
-  }
-});
+// sendPractitionerInvitation removed 2026-10-02 (Adam approved): coach features are retired; it let any signed-in user email any address.
 
 // Send notification email when user expresses practitioner interest during signup
 exports.sendPractitionerInquiryNotification = onRequest(
@@ -3648,70 +3060,7 @@ exports.deleteFile = onRequest(async (req, res) => {
 // ===== SOPHY'S INSIGHTS SYSTEM =====
 
 // Test function for single user insights (for troubleshooting)
-exports.testUserInsights = onCall({
-  secrets: [OPENAI_API_KEY, SENDGRID_API_KEY]
-}, async (request) => {
-  const requestId = generateRequestId();
-  console.log(`[${requestId}] Test insights for user: ${request.auth?.uid}`);
-  
-  // Verify user is authenticated
-  if (!request.auth) {
-    throw new HttpsError('unauthenticated', 'Must be authenticated to test insights');
-  }
-  
-  const userId = request.auth.uid;
-  
-  try {
-    // Get user data
-    const userDoc = await admin.firestore().collection('users').doc(userId).get();
-    if (!userDoc.exists) {
-      throw new HttpsError('not-found', 'User profile not found');
-    }
-    
-    const userData = userDoc.data();
-    if (!userData.email) {
-      throw new HttpsError('failed-precondition', 'User email not found');
-    }
-
-    console.log(`[${requestId}] Generating test weekly insights`);
-    const weeklyData = await collectWeeklyUserData(userId, requestId);
-    
-    if (weeklyData.stats.totalEntries === 0) {
-      return {
-        status: 'skipped', 
-        message: 'No journal or manifest entries found for the past 7 days'
-      };
-    }
-    
-    const { journalEntries, manifestEntries, stats } = weeklyData;
-    
-    const insights = await generateInsightsWithOpenAI(
-      journalEntries, 
-      manifestEntries, 
-      stats, 
-      'weekly', 
-      userData.signupUsername || userData.displayName || 'Friend',
-      requestId
-    );
-    
-    await sendInsightsEmail(userData.email, insights, 'weekly', userData.signupUsername || userData.displayName);
-    
-    return {
-      status: 'success',
-      message: `Weekly insights sent to ${userData.email}`,
-      stats: {
-        journalEntries: journalEntries.length,
-        manifestEntries: manifestEntries.length,
-        totalWords: stats.totalWords,
-        daysActive: stats.daysActive
-      }
-    };
-    
-  } catch (error) {
-    console.error(`[${requestId}] Test insights failed:`, error);
-    throw new HttpsError('internal', `Test insights failed: ${error.message}`);
-  }
-});
+// testUserInsights removed 2026-10-02 (Adam approved): test tool; it emailed insights to a user-editable address.
 
 // Scheduled function for weekly insights (runs every Monday at 9 AM UTC)
 exports.sendWeeklyInsights = onRequest({
@@ -3726,6 +3075,22 @@ exports.sendWeeklyInsights = onRequest({
     
     if (req.method !== 'POST') {
       return sendSecureErrorResponse(res, 405, 'Method not allowed', null);
+    }
+
+    // Admins only (2026-10-02, Adam approved). The Sunday scheduler does the real run.
+    const idToken = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    if (!idToken) {
+      return sendSecureErrorResponse(res, 401, 'Sign in required', null);
+    }
+    let callerUid;
+    try {
+      callerUid = (await admin.auth().verifyIdToken(idToken)).uid;
+    } catch (e) {
+      return sendSecureErrorResponse(res, 401, 'Sign in required', null);
+    }
+    const callerDoc = await admin.firestore().collection('users').doc(callerUid).get();
+    if (!callerDoc.exists || callerDoc.data().userRole !== 'admin') {
+      return sendSecureErrorResponse(res, 403, 'Admins only', null);
     }
     
     await generateAndSendInsights('weekly', requestId);
@@ -5189,10 +4554,16 @@ exports.addToMailchimp = onCall({
   const requestId = generateRequestId();
   console.log(`[${requestId}] 📧 Syncing signup email to ActiveCampaign`);
 
-  const { email, platform } = request.data;
+  // Sign-in required, and only the caller's own sign-in email is added
+  // (2026-10-02, Adam approved). The email in request.data is ignored.
+  if (!request.auth) {
+    throw new HttpsError('unauthenticated', 'Sign in required');
+  }
+  const email = request.auth.token.email;
+  const platform = request.data?.platform;
   if (!email) {
-    console.error(`[${requestId}] ❌ Email is required`);
-    throw new HttpsError('invalid-argument', 'Email is required');
+    console.error(`[${requestId}] ❌ No email on the signed-in account`);
+    throw new HttpsError('failed-precondition', 'No email on this account');
   }
 
   const AC_URL = 'https://pegasusrealm.api-us1.com';
@@ -9011,62 +8382,7 @@ exports.triggerSmsDeduplicationCleanup = onCall({
  * Call via: firebase functions:call testPushNotification --data '{"userId":"YOUR_USER_ID"}'
  * Or from admin console
  */
-exports.testPushNotification = onCall(async (request) => {
-  const { userId } = request.data;
-  
-  if (!userId) {
-    throw new HttpsError('invalid-argument', 'userId is required');
-  }
-  
-  // Get user document
-  const userDoc = await admin.firestore().collection('users').doc(userId).get();
-  
-  if (!userDoc.exists) {
-    return { success: false, error: 'User not found' };
-  }
-  
-  const userData = userDoc.data();
-  
-  console.log(`🔍 User ${userId} data:`, {
-    fcmToken: userData.fcmToken ? `${userData.fcmToken.substring(0, 20)}...` : 'NOT SET',
-    platform: userData.platform,
-    lastTokenUpdate: userData.lastTokenUpdate,
-    pushPreferences: userData.pushPreferences
-  });
-  
-  if (!userData.fcmToken) {
-    return { 
-      success: false, 
-      error: 'No FCM token found for this user',
-      debug: {
-        hasPushPreferences: !!userData.pushPreferences,
-        pushEnabled: userData.pushPreferences?.enabled
-      }
-    };
-  }
-  
-  // Try to send test notification
-  try {
-    const result = await sendPushNotification(
-      userData.fcmToken,
-      '🔔 Test Notification',
-      'If you see this, push notifications are working!',
-      { type: 'test', timestamp: Date.now().toString() }
-    );
-    
-    return { 
-      success: result, 
-      message: result ? 'Push notification sent successfully!' : 'Failed to send push notification',
-      fcmTokenPrefix: userData.fcmToken.substring(0, 30) + '...'
-    };
-  } catch (error) {
-    return { 
-      success: false, 
-      error: error.message,
-      code: error.code
-    };
-  }
-});
+// testPushNotification removed 2026-10-02 (Adam approved): test tool with no sign-in check; anyone could push to any user.
 
 // =============================================================================
 // WISH MILESTONE NOTIFICATIONS - Scheduled daily check
