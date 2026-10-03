@@ -6289,7 +6289,7 @@ async function stripeSubscriptionLive(subId) {
   }
 }
 
-async function syncRevenueCatTier(uid, reason, dryRun = false, sandboxEvent = false) {
+async function syncRevenueCatTier(uid, reason, dryRun = false) {
   const ref = admin.firestore().collection('users').doc(uid);
   const snap = await ref.get();
   if (!snap.exists) return { uid, from: null, to: null, skipped: 'no user' };
@@ -6297,8 +6297,11 @@ async function syncRevenueCatTier(uid, reason, dryRun = false, sandboxEvent = fa
   const rc = await fetchRevenueCatState(uid);
   const current = u.subscriptionTier || 'free';
   const fromRevenueCat = u.subscriptionSource === 'revenuecat';
-  const phoneWrote = ['ios', 'android'].includes(u.subscriptionPlatform);
-  const tester = ['alpha', 'beta'].includes(u.special_code) || u.role === 'alpha' ||
+  // A paid tier the old phone app wrote itself. Only trusted for users this webhook has
+  // never seen, since users can still edit subscriptionPlatform.
+  const phoneWrote = !u.revenuecatSyncedAt && ['ios', 'android'].includes(u.subscriptionPlatform);
+  // Alpha only: "beta" was stamped on every phone email sign-up for months (Bruce).
+  const tester = u.special_code === 'alpha' || u.role === 'alpha' ||
     (Array.isArray(u.roles) && u.roles.includes('alpha'));
   const stripeLive = await stripeSubscriptionLive(u.stripeSubscriptionId);
   const update = {
@@ -6326,10 +6329,10 @@ async function syncRevenueCatTier(uid, reason, dryRun = false, sandboxEvent = fa
         subscriptionWillRenew: rc.willRenew,
       });
     }
-  } else if ((fromRevenueCat || phoneWrote) && !tester && !stripeLive && !sandboxEvent && current !== 'free') {
+  } else if ((fromRevenueCat || phoneWrote) && !tester && !stripeLive && current !== 'free') {
     // The phone subscription ended. Only a tier a phone purchase granted (this webhook,
-    // or the old phone app writing it itself) is taken back. Alpha and beta testers are
-    // never stepped down here, and sandbox (test) events never step anyone down.
+    // or the old phone app writing it itself) is taken back. Alpha testers are never
+    // stepped down here.
     Object.assign(update, {
       subscriptionTier: 'free',
       subscriptionStatus: 'inactive',
@@ -6337,7 +6340,8 @@ async function syncRevenueCatTier(uid, reason, dryRun = false, sandboxEvent = fa
     });
   }
   if (!dryRun) await ref.update(update);
-  return { uid, from: current, to: update.subscriptionTier || current };
+  return { uid, from: current, to: update.subscriptionTier || current,
+    takeover: !fromRevenueCat && !!update.subscriptionSource };
 }
 
 exports.revenuecatWebhook = onRequest({
@@ -6378,7 +6382,7 @@ exports.revenuecatWebhook = onRequest({
     for (const uid of uids) {
       try {
         const r = await syncRevenueCatTier(uid, dryRun ? 'resync (dry run)' : 'resync', dryRun);
-        if (r.from !== r.to) changes.push(r);
+        if (r.from !== r.to || r.takeover) changes.push(r);
       } catch (e) {
         failed++;
         console.error(`[${requestId}] RevenueCat resync failed for ${uid}: ${e.message}`);
@@ -6403,8 +6407,7 @@ exports.revenuecatWebhook = onRequest({
 
   try {
     const results = [];
-    const sandbox = event.environment === 'SANDBOX';
-    for (const uid of ids) results.push(await syncRevenueCatTier(uid, `webhook:${event.type}`, false, sandbox));
+    for (const uid of ids) results.push(await syncRevenueCatTier(uid, `webhook:${event.type}`));
     console.log(`[${requestId}] RevenueCat ${event.type} (${event.environment || 'unknown env'}):`, JSON.stringify(results));
     return res.status(200).json({ ok: true });
   } catch (e) {
