@@ -41,6 +41,8 @@ const TWILIO_AUTH_TOKEN = defineSecret("TWILIO_AUTH_TOKEN");
 const TWILIO_PHONE_NUMBER = defineSecret("TWILIO_PHONE_NUMBER");
 const STRIPE_SECRET_KEY = defineSecret("STRIPE_SECRET_KEY");
 const STRIPE_WEBHOOK_SECRET = defineSecret("STRIPE_WEBHOOK_SECRET");
+const REVENUECAT_WEBHOOK_AUTH = defineSecret("REVENUECAT_WEBHOOK_AUTH"); // 2026-10-03
+const REVENUECAT_SECRET_KEY = defineSecret("REVENUECAT_SECRET_KEY"); // 2026-10-03, RevenueCat secret API key (V1)
 const { onDocumentCreated } = require("firebase-functions/v2/firestore");
 
 // Simple Firebase Admin initialization - let it auto-detect credentials
@@ -6222,6 +6224,180 @@ exports.createBillingPortalSession = onCall({
   } catch (error) {
     console.error('❌ Error creating billing portal session:', error);
     throw new HttpsError('internal', error.message || 'Failed to open subscription management');
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REVENUECAT WEBHOOK (2026-10-03, Adam approved)
+// The 10/01 Firestore rules stop the phone app from writing its own tier, so
+// App Store and Google Play purchases reach the server here instead.
+// RevenueCat's app_user_id is the Firebase uid (mobile_2 SubscriptionService
+// calls Purchases.logIn(uid)). On every event we ask RevenueCat for the
+// customer's current state, as RevenueCat recommends, so event order,
+// refunds and transfers all come out right.
+// Setup: secrets REVENUECAT_WEBHOOK_AUTH and REVENUECAT_SECRET_KEY, and a
+// RevenueCat webhook pointed here with that same Authorization value.
+// Backfill by hand: POST {"resync":"phone"} or {"resync":["uid",...]} with
+// the same Authorization header.
+// ═══════════════════════════════════════════════════════════════════════════
+const RC_TIER_RANK = { free: 0, plus: 1, connect: 2 };
+
+function rcEntitlementActive(ent, nowMs) {
+  if (!ent) return false;
+  if (!ent.expires_date) return true; // non-expiring purchase
+  const exp = Date.parse(ent.expires_date) || 0;
+  const grace = ent.grace_period_expires_date ? (Date.parse(ent.grace_period_expires_date) || 0) : 0;
+  return Math.max(exp, grace) > nowMs;
+}
+
+async function fetchRevenueCatState(uid) {
+  const r = await fetch(`https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(uid)}`, {
+    headers: { Authorization: `Bearer ${REVENUECAT_SECRET_KEY.value()}`, 'Content-Type': 'application/json' }
+  });
+  if (!r.ok) throw new Error(`RevenueCat API ${r.status}`);
+  const sub = (await r.json()).subscriber || {};
+  const ents = sub.entitlements || {};
+  const now = Date.now();
+  let tier = 'free';
+  let ent = null;
+  if (rcEntitlementActive(ents.connect, now)) { tier = 'connect'; ent = ents.connect; }
+  else if (rcEntitlementActive(ents.plus, now)) { tier = 'plus'; ent = ents.plus; }
+  let platform = null;
+  let willRenew = false;
+  let expiresAt = null;
+  if (ent) {
+    const s = (sub.subscriptions || {})[ent.product_identifier] || {};
+    platform = s.store === 'app_store' ? 'ios' : s.store === 'play_store' ? 'android' : (s.store || null);
+    willRenew = !!s.expires_date && !s.unsubscribe_detected_at && !s.refunded_at;
+    expiresAt = ent.expires_date ? new Date(ent.expires_date) : null;
+  }
+  return { tier, platform, willRenew, expiresAt };
+}
+
+// True when the user's web (Stripe) subscription is still live. Unsure counts as live,
+// so a Stripe error never takes Plus away from someone who is paying on the web.
+async function stripeSubscriptionLive(subId) {
+  if (!subId) return false;
+  try {
+    const stripe = require('stripe')(STRIPE_SECRET_KEY.value());
+    const s = await stripe.subscriptions.retrieve(subId);
+    return ['active', 'trialing', 'past_due'].includes(s.status);
+  } catch (e) {
+    console.warn(`RevenueCat sync: Stripe check failed for ${subId}: ${e.message}`);
+    return true;
+  }
+}
+
+async function syncRevenueCatTier(uid, reason) {
+  const ref = admin.firestore().collection('users').doc(uid);
+  const snap = await ref.get();
+  if (!snap.exists) return { uid, from: null, to: null, skipped: 'no user' };
+  const u = snap.data();
+  const rc = await fetchRevenueCatState(uid);
+  const current = u.subscriptionTier || 'free';
+  const phoneManaged = ['ios', 'android'].includes(u.subscriptionPlatform) || u.subscriptionSource === 'revenuecat';
+  const stripeLive = await stripeSubscriptionLive(u.stripeSubscriptionId);
+  const update = {
+    revenuecatTier: rc.tier,
+    revenuecatSyncedAt: admin.firestore.FieldValue.serverTimestamp(),
+    revenuecatLastReason: reason,
+  };
+  if (RC_TIER_RANK[rc.tier] > 0) {
+    if (stripeLive) {
+      // Paying on the web too: Stripe stays in charge; only ever raise the tier.
+      if (RC_TIER_RANK[rc.tier] > (RC_TIER_RANK[current] || 0)) update.subscriptionTier = rc.tier;
+    } else {
+      Object.assign(update, {
+        subscriptionTier: rc.tier,
+        subscriptionStatus: 'active',
+        subscriptionPlatform: rc.platform || 'unknown',
+        subscriptionSource: 'revenuecat',
+        subscriptionExpiresAt: rc.expiresAt ? admin.firestore.Timestamp.fromDate(rc.expiresAt) : null,
+        subscriptionWillRenew: rc.willRenew,
+      });
+    }
+  } else if (phoneManaged && !stripeLive && current !== 'free') {
+    // The phone subscription ended. An admin-set tier still stands.
+    const override = u.betaProgress?.tierOverride?.tier;
+    const next = override && RC_TIER_RANK[override] > 0 ? override : 'free';
+    Object.assign(update, {
+      subscriptionTier: next,
+      subscriptionStatus: next === 'free' ? 'inactive' : 'active',
+      subscriptionWillRenew: false,
+    });
+  }
+  await ref.update(update);
+  return { uid, from: current, to: update.subscriptionTier || current };
+}
+
+exports.revenuecatWebhook = onRequest({
+  secrets: [REVENUECAT_WEBHOOK_AUTH, REVENUECAT_SECRET_KEY, STRIPE_SECRET_KEY],
+  timeoutSeconds: 540,
+}, async (req, res) => {
+  const requestId = generateRequestId();
+  if (req.method !== 'POST') return res.status(405).send('Method not allowed');
+
+  const crypto = require('crypto');
+  const expected = Buffer.from(REVENUECAT_WEBHOOK_AUTH.value() || '');
+  const got = Buffer.from(String(req.headers.authorization || ''));
+  if (!expected.length || got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) {
+    console.warn(`[${requestId}] RevenueCat webhook: bad Authorization header`);
+    return res.status(401).send('Unauthorized');
+  }
+
+  const body = req.body || {};
+
+  // Backfill, run by hand
+  if (body.resync) {
+    let uids = [];
+    if (Array.isArray(body.resync)) {
+      uids = body.resync.map(String).slice(0, 1000);
+    } else if (body.resync === 'phone') {
+      const users = await admin.firestore().collection('users').get();
+      users.forEach(d => {
+        const u = d.data();
+        const platforms = [u.platform, u.subscriptionPlatform, u.activity?.platform];
+        if (platforms.some(p => p === 'ios' || p === 'android') || u.subscriptionSource === 'revenuecat') uids.push(d.id);
+      });
+    } else {
+      return res.status(400).json({ error: 'resync must be "phone" or a list of user ids' });
+    }
+    const changes = [];
+    let failed = 0;
+    for (const uid of uids) {
+      try {
+        const r = await syncRevenueCatTier(uid, 'resync');
+        if (r.from !== r.to) changes.push(r);
+      } catch (e) {
+        failed++;
+        console.error(`[${requestId}] RevenueCat resync failed for ${uid}: ${e.message}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 150));
+    }
+    console.log(`[${requestId}] RevenueCat resync: ${uids.length} checked, ${changes.length} changed, ${failed} failed`);
+    return res.status(200).json({ checked: uids.length, changed: changes.length, failed, changes });
+  }
+
+  const event = body.event || {};
+  if (!event.type) return res.status(400).send('No event');
+  if (event.type === 'TEST') {
+    console.log(`[${requestId}] RevenueCat test event received`);
+    return res.status(200).json({ ok: true, test: true });
+  }
+
+  const ids = new Set();
+  [event.app_user_id, event.original_app_user_id, ...(event.aliases || []),
+    ...(event.transferred_from || []), ...(event.transferred_to || [])]
+    .forEach(id => { if (id && !String(id).startsWith('$RCAnonymousID')) ids.add(String(id)); });
+
+  try {
+    const results = [];
+    for (const uid of ids) results.push(await syncRevenueCatTier(uid, `webhook:${event.type}`));
+    console.log(`[${requestId}] RevenueCat ${event.type} (${event.environment || 'unknown env'}):`, JSON.stringify(results));
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error(`[${requestId}] RevenueCat webhook sync failed: ${e.message}`);
+    return res.status(500).send('Sync failed'); // RevenueCat retries
   }
 });
 
