@@ -6289,7 +6289,7 @@ async function stripeSubscriptionLive(subId) {
   }
 }
 
-async function syncRevenueCatTier(uid, reason, dryRun = false) {
+async function syncRevenueCatTier(uid, reason, dryRun = false, sandboxEvent = false) {
   const ref = admin.firestore().collection('users').doc(uid);
   const snap = await ref.get();
   if (!snap.exists) return { uid, from: null, to: null, skipped: 'no user' };
@@ -6297,6 +6297,7 @@ async function syncRevenueCatTier(uid, reason, dryRun = false) {
   const rc = await fetchRevenueCatState(uid);
   const current = u.subscriptionTier || 'free';
   const fromRevenueCat = u.subscriptionSource === 'revenuecat';
+  const phoneWrote = ['ios', 'android'].includes(u.subscriptionPlatform);
   const tester = ['alpha', 'beta'].includes(u.special_code) || u.role === 'alpha' ||
     (Array.isArray(u.roles) && u.roles.includes('alpha'));
   const stripeLive = await stripeSubscriptionLive(u.stripeSubscriptionId);
@@ -6310,10 +6311,14 @@ async function syncRevenueCatTier(uid, reason, dryRun = false) {
       // Paying on the web too: Stripe stays in charge; only ever raise the tier.
       if (RC_TIER_RANK[rc.tier] > (RC_TIER_RANK[current] || 0)) update.subscriptionTier = rc.tier;
     } else {
-      // A higher tier set some other way (an admin comp) is never lowered here.
-      const keepHigher = !fromRevenueCat && (RC_TIER_RANK[current] || 0) > RC_TIER_RANK[rc.tier];
-      Object.assign(update, {
-        subscriptionTier: keepHigher ? current : rc.tier,
+      // A tier set some other way (an admin comp) that is equal or higher is left alone
+      // entirely, so a later phone expiry can't take it away. A paid tier the old phone
+      // app wrote itself (platform ios/android) is taken over, so its expiry is handled.
+      const curRank = RC_TIER_RANK[current] || 0;
+      const leaveAlone = !fromRevenueCat &&
+        (curRank > RC_TIER_RANK[rc.tier] || (curRank === RC_TIER_RANK[rc.tier] && !phoneWrote));
+      if (!leaveAlone) Object.assign(update, {
+        subscriptionTier: rc.tier,
         subscriptionStatus: 'active',
         subscriptionPlatform: rc.platform || 'unknown',
         subscriptionSource: 'revenuecat',
@@ -6321,9 +6326,10 @@ async function syncRevenueCatTier(uid, reason, dryRun = false) {
         subscriptionWillRenew: rc.willRenew,
       });
     }
-  } else if (fromRevenueCat && !tester && !stripeLive && current !== 'free') {
-    // The phone subscription ended. Only a tier this webhook granted is taken back;
-    // alpha and beta testers and admin comps are never stepped down here.
+  } else if ((fromRevenueCat || phoneWrote) && !tester && !stripeLive && !sandboxEvent && current !== 'free') {
+    // The phone subscription ended. Only a tier a phone purchase granted (this webhook,
+    // or the old phone app writing it itself) is taken back. Alpha and beta testers are
+    // never stepped down here, and sandbox (test) events never step anyone down.
     Object.assign(update, {
       subscriptionTier: 'free',
       subscriptionStatus: 'inactive',
@@ -6397,7 +6403,8 @@ exports.revenuecatWebhook = onRequest({
 
   try {
     const results = [];
-    for (const uid of ids) results.push(await syncRevenueCatTier(uid, `webhook:${event.type}`));
+    const sandbox = event.environment === 'SANDBOX';
+    for (const uid of ids) results.push(await syncRevenueCatTier(uid, `webhook:${event.type}`, false, sandbox));
     console.log(`[${requestId}] RevenueCat ${event.type} (${event.environment || 'unknown env'}):`, JSON.stringify(results));
     return res.status(200).json({ ok: true });
   } catch (e) {
