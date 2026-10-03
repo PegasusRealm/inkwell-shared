@@ -6260,7 +6260,7 @@ function rcEntitlementActive(ent, nowMs) {
 
 async function fetchRevenueCatState(uid) {
   const r = await fetch(`https://api.revenuecat.com/v1/subscribers/${encodeURIComponent(uid)}`, {
-    headers: { Authorization: `Bearer ${REVENUECAT_SECRET_KEY.value()}`, 'Content-Type': 'application/json' }
+    headers: { Authorization: `Bearer ${(REVENUECAT_SECRET_KEY.value() || '').trim()}`, 'Content-Type': 'application/json' }
   });
   if (!r.ok) throw new Error(`RevenueCat API ${r.status}`);
   const sub = (await r.json()).subscriber || {};
@@ -6360,7 +6360,7 @@ exports.revenuecatWebhook = onRequest({
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
 
   const crypto = require('crypto');
-  const expected = Buffer.from(REVENUECAT_WEBHOOK_AUTH.value() || '');
+  const expected = Buffer.from((REVENUECAT_WEBHOOK_AUTH.value() || '').trim());
   const got = Buffer.from(String(req.headers.authorization || ''));
   if (!expected.length || got.length !== expected.length || !crypto.timingSafeEqual(got, expected)) {
     console.warn(`[${requestId}] RevenueCat webhook: bad Authorization header`);
@@ -6386,6 +6386,7 @@ exports.revenuecatWebhook = onRequest({
       return res.status(400).json({ error: 'resync must be "phone" or a list of user ids' });
     }
     const changes = [];
+    const errors = [];
     let failed = 0;
     for (const uid of uids) {
       try {
@@ -6393,12 +6394,13 @@ exports.revenuecatWebhook = onRequest({
         if (r.from !== r.to || r.takeover) changes.push(r);
       } catch (e) {
         failed++;
+        if (errors.length < 3) errors.push(e.message);
         console.error(`[${requestId}] RevenueCat resync failed for ${uid}: ${e.message}`);
       }
       await new Promise(resolve => setTimeout(resolve, 150));
     }
     console.log(`[${requestId}] RevenueCat resync${dryRun ? ' (dry run)' : ''}: ${uids.length} checked, ${changes.length} changed, ${failed} failed`);
-    return res.status(200).json({ dryRun, checked: uids.length, changed: changes.length, failed, changes });
+    return res.status(200).json({ dryRun, checked: uids.length, changed: changes.length, failed, errors, changes });
   }
 
   const event = body.event || {};
