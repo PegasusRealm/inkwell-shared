@@ -6238,7 +6238,7 @@ exports.createBillingPortalSession = onCall({
 // Setup: secrets REVENUECAT_WEBHOOK_AUTH and REVENUECAT_SECRET_KEY, and a
 // RevenueCat webhook pointed here with that same Authorization value.
 // Backfill by hand: POST {"resync":"phone"} or {"resync":["uid",...]} with
-// the same Authorization header.
+// the same Authorization header. Add "dryRun":true to see changes without writing.
 // ═══════════════════════════════════════════════════════════════════════════
 const RC_TIER_RANK = { free: 0, plus: 1, connect: 2 };
 
@@ -6283,19 +6283,22 @@ async function stripeSubscriptionLive(subId) {
     const s = await stripe.subscriptions.retrieve(subId);
     return ['active', 'trialing', 'past_due'].includes(s.status);
   } catch (e) {
+    if (e.code === 'resource_missing') return false; // no such subscription
     console.warn(`RevenueCat sync: Stripe check failed for ${subId}: ${e.message}`);
     return true;
   }
 }
 
-async function syncRevenueCatTier(uid, reason) {
+async function syncRevenueCatTier(uid, reason, dryRun = false) {
   const ref = admin.firestore().collection('users').doc(uid);
   const snap = await ref.get();
   if (!snap.exists) return { uid, from: null, to: null, skipped: 'no user' };
   const u = snap.data();
   const rc = await fetchRevenueCatState(uid);
   const current = u.subscriptionTier || 'free';
-  const phoneManaged = ['ios', 'android'].includes(u.subscriptionPlatform) || u.subscriptionSource === 'revenuecat';
+  const fromRevenueCat = u.subscriptionSource === 'revenuecat';
+  const tester = ['alpha', 'beta'].includes(u.special_code) || u.role === 'alpha' ||
+    (Array.isArray(u.roles) && u.roles.includes('alpha'));
   const stripeLive = await stripeSubscriptionLive(u.stripeSubscriptionId);
   const update = {
     revenuecatTier: rc.tier,
@@ -6307,8 +6310,10 @@ async function syncRevenueCatTier(uid, reason) {
       // Paying on the web too: Stripe stays in charge; only ever raise the tier.
       if (RC_TIER_RANK[rc.tier] > (RC_TIER_RANK[current] || 0)) update.subscriptionTier = rc.tier;
     } else {
+      // A higher tier set some other way (an admin comp) is never lowered here.
+      const keepHigher = !fromRevenueCat && (RC_TIER_RANK[current] || 0) > RC_TIER_RANK[rc.tier];
       Object.assign(update, {
-        subscriptionTier: rc.tier,
+        subscriptionTier: keepHigher ? current : rc.tier,
         subscriptionStatus: 'active',
         subscriptionPlatform: rc.platform || 'unknown',
         subscriptionSource: 'revenuecat',
@@ -6316,23 +6321,22 @@ async function syncRevenueCatTier(uid, reason) {
         subscriptionWillRenew: rc.willRenew,
       });
     }
-  } else if (phoneManaged && !stripeLive && current !== 'free') {
-    // The phone subscription ended. An admin-set tier still stands.
-    const override = u.betaProgress?.tierOverride?.tier;
-    const next = override && RC_TIER_RANK[override] > 0 ? override : 'free';
+  } else if (fromRevenueCat && !tester && !stripeLive && current !== 'free') {
+    // The phone subscription ended. Only a tier this webhook granted is taken back;
+    // alpha and beta testers and admin comps are never stepped down here.
     Object.assign(update, {
-      subscriptionTier: next,
-      subscriptionStatus: next === 'free' ? 'inactive' : 'active',
+      subscriptionTier: 'free',
+      subscriptionStatus: 'inactive',
       subscriptionWillRenew: false,
     });
   }
-  await ref.update(update);
+  if (!dryRun) await ref.update(update);
   return { uid, from: current, to: update.subscriptionTier || current };
 }
 
 exports.revenuecatWebhook = onRequest({
   secrets: [REVENUECAT_WEBHOOK_AUTH, REVENUECAT_SECRET_KEY, STRIPE_SECRET_KEY],
-  timeoutSeconds: 540,
+  timeoutSeconds: 3600, // the hand-run backfill can take a while; normal events take seconds
 }, async (req, res) => {
   const requestId = generateRequestId();
   if (req.method !== 'POST') return res.status(405).send('Method not allowed');
@@ -6349,6 +6353,7 @@ exports.revenuecatWebhook = onRequest({
 
   // Backfill, run by hand
   if (body.resync) {
+    const dryRun = body.dryRun === true;
     let uids = [];
     if (Array.isArray(body.resync)) {
       uids = body.resync.map(String).slice(0, 1000);
@@ -6366,7 +6371,7 @@ exports.revenuecatWebhook = onRequest({
     let failed = 0;
     for (const uid of uids) {
       try {
-        const r = await syncRevenueCatTier(uid, 'resync');
+        const r = await syncRevenueCatTier(uid, dryRun ? 'resync (dry run)' : 'resync', dryRun);
         if (r.from !== r.to) changes.push(r);
       } catch (e) {
         failed++;
@@ -6374,8 +6379,8 @@ exports.revenuecatWebhook = onRequest({
       }
       await new Promise(resolve => setTimeout(resolve, 150));
     }
-    console.log(`[${requestId}] RevenueCat resync: ${uids.length} checked, ${changes.length} changed, ${failed} failed`);
-    return res.status(200).json({ checked: uids.length, changed: changes.length, failed, changes });
+    console.log(`[${requestId}] RevenueCat resync${dryRun ? ' (dry run)' : ''}: ${uids.length} checked, ${changes.length} changed, ${failed} failed`);
+    return res.status(200).json({ dryRun, checked: uids.length, changed: changes.length, failed, changes });
   }
 
   const event = body.event || {};
